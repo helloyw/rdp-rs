@@ -232,11 +232,13 @@ impl Connector {
         };
         // Create the x224 layer
         // With all negotiated security stuff and credentials
-        let mut protocols = x224::Protocols::ProtocolSSL as u32;
-        if self.use_nla {
-            protocols |= x224::Protocols::ProtocolHybrid as u32;
-            protocols |= x224::Protocols::ProtocolHybridEx as u32;
-        }
+        let protocols = if self.use_nla {
+            x224::Protocols::ProtocolSSL as u32
+                | x224::Protocols::ProtocolHybrid as u32
+                | x224::Protocols::ProtocolHybridEx as u32
+        } else {
+            x224::Protocols::ProtocolSSL as u32
+        };
 
         let x224 = x224::Client::connect(
             tpkt::Client::new(tcp),

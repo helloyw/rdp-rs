@@ -239,7 +239,20 @@ impl<S: Read + Write> Client<S> {
         let nego = cast!(DataType::Component, confirm["negotiation"]).unwrap();
 
         match NegotiationType::try_from(cast!(DataType::U8, nego["type"])?)? {
-            NegotiationType::TypeRDPNegFailure => Err(Error::RdpError(RdpError::new(RdpErrorKind::ProtocolNegFailure, "Error during negotiation step"))),
+            NegotiationType::TypeRDPNegFailure => {
+                let failure_code = cast!(DataType::U32, nego["result"]).unwrap_or(0);
+                let reason = match failure_code {
+                    1 => "SSL_REQUIRED_BY_SERVER",
+                    2 => "SSL_NOT_ALLOWED_BY_SERVER",
+                    3 => "SSL_CERT_NOT_ON_SERVER",
+                    4 => "INCONSISTENT_FLAGS",
+                    5 => "HYBRID_REQUIRED_BY_SERVER",
+                    6 => "SSL_WITH_USER_AUTH_REQUIRED_BY_SERVER",
+                    _ => "UNKNOWN"
+                };
+                Err(Error::RdpError(RdpError::new(RdpErrorKind::ProtocolNegFailure,
+                    &format!("Negotiation failed: {} (code {})", reason, failure_code))))
+            },
             NegotiationType::TypeRDPNegReq => Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidAutomata, "Server reject security protocols"))),
             NegotiationType::TypeRDPNegRsp => Ok(Protocols::try_from(cast!(DataType::U32, nego["result"])?)?)
         }
