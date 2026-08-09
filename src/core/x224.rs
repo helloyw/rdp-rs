@@ -206,6 +206,16 @@ impl<S: Read + Write> Client<S> {
     /// ).unwrap()
     /// ```
     pub fn connect(mut tpkt: tpkt::Client<S>, security_protocols: u32, check_certificate: bool, authentication_protocol: Option<&mut dyn AuthenticationProtocol>, restricted_admin_mode: bool, blank_creds: bool) -> RdpResult<Client<S>> {
+        if security_protocols == Protocols::ProtocolRDP as u32 {
+            // Standard RDP security: send X.224 Connection Request without negotiation data
+            tpkt.write(component![
+                "header" => x224_crq(0, MessageType::X224TPDUConnectionRequest)
+            ])?;
+            // Read X.224 Connection Confirm (no negotiation data expected)
+            let _buffer = try_let!(tpkt::Payload::Raw, tpkt.read()?)?;
+            return Ok(Client::new(tpkt, Protocols::ProtocolRDP));
+        }
+
         Self::write_connection_request(&mut tpkt, security_protocols, Some(if restricted_admin_mode { RequestMode::RestrictedAdminModeRequired as u8} else { 0 }))?;
         match Self::read_connection_confirm(&mut tpkt)? {
             Protocols::ProtocolHybrid | Protocols::ProtocolHybridEx => Ok(Client::new(tpkt.start_nla(check_certificate, authentication_protocol.unwrap(), restricted_admin_mode || blank_creds)?,Protocols::ProtocolHybrid)),

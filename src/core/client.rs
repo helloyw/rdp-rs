@@ -237,7 +237,8 @@ impl Connector {
                 | x224::Protocols::ProtocolHybrid as u32
                 | x224::Protocols::ProtocolHybridEx as u32
         } else {
-            x224::Protocols::ProtocolSSL as u32
+            // No NLA/SSL - use standard RDP security
+            x224::Protocols::ProtocolRDP as u32
         };
 
         let x224 = x224::Client::connect(
