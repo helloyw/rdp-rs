@@ -200,11 +200,11 @@ impl<S: Read + Write> Client<S> {
     /// let addr = "127.0.0.1:3389".parse::<SocketAddr>().unwrap();
     /// let mut tcp = TcpStream::connect(&addr).unwrap();
     /// let mut tpkt = tpkt::Client::new(link::Link::new(link::Stream::Raw(tcp)));
-    /// let mut tpkt_nla = tpkt.start_nla(false, &mut Ntlm::new("domain".to_string(), "username".to_string(), "password".to_string()), false);
+    /// let mut tpkt_nla = tpkt.start_nla(false, &mut Ntlm::new("domain".to_string(), "username".to_string(), "password".to_string()), false, false);
     /// ```
-    pub fn start_nla(self, check_certificate: bool, authentication_protocol: &mut dyn AuthenticationProtocol, restricted_admin_mode: bool) -> RdpResult<Client<S>> {
+    pub fn start_nla(self, check_certificate: bool, authentication_protocol: &mut dyn AuthenticationProtocol, restricted_admin_mode: bool, early_user_auth: bool) -> RdpResult<Client<S>> {
         let mut link = self.transport.start_ssl(check_certificate)?;
-        cssp_connect(&mut link, authentication_protocol, restricted_admin_mode)?;
+        cssp_connect(&mut link, authentication_protocol, restricted_admin_mode, early_user_auth)?;
         Ok(Client::new(link))
     }
 

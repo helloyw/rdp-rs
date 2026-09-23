@@ -160,10 +160,44 @@ fn create_ts_authinfo(auth_info: Vec<u8>) -> Vec<u8> {
     to_der(&ts_authinfo)
 }
 
+/// Result codes used by the server for the PROTOCOL_HYBRID_EX
+/// "Early User Authorization Result" (MS-RDPBCGR 3.1.5.4.2 / MS-CSSP).
+pub const AUTHZ_SUCCESS: u32 = 0x0000_0000;
+pub const AUTHZ_ACCESS_DENIED: u32 = 0x0000_0005;
+
+/// Read the Early User Authorization Result.
+///
+/// When PROTOCOL_HYBRID_EX has been negotiated the server sends a bare 4 bytes
+/// little endian result once the encrypted credentials have been sent. It is
+/// *not* wrapped in a TSRequest, so it has to be consumed here. If it is left
+/// in the stream the following TPKT header is parsed from these bytes and the
+/// connection dies with "Invalid minimal size for TPKT".
+pub fn read_early_user_auth<S: Read + Write>(link: &mut Link<S>) -> RdpResult<()> {
+    let raw = link.read(4)?;
+    if raw.len() < 4 {
+        return Err(Error::RdpError(RdpError::new(
+            RdpErrorKind::InvalidSize,
+            "Early User Authorization Result is truncated",
+        )));
+    }
+    let result = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    match result {
+        AUTHZ_SUCCESS => Ok(()),
+        AUTHZ_ACCESS_DENIED => Err(Error::RdpError(RdpError::new(
+            RdpErrorKind::RejectedByServer,
+            "Early User Authorization Result: ACCESS_DENIED (credentials accepted but the account is not authorized to open a session on this host)",
+        ))),
+        other => Err(Error::RdpError(RdpError::new(
+            RdpErrorKind::RejectedByServer,
+            &format!("Early User Authorization Result: unexpected code 0x{:08x}", other),
+        ))),
+    }
+}
+
 /// This the main function for CSSP protocol
 /// It will use the raw link layer and the selected authenticate protocol
 /// to perform the NLA authenticate
-pub fn cssp_connect<S: Read + Write>(link: &mut Link<S>, authentication_protocol: &mut dyn AuthenticationProtocol, restricted_admin_mode: bool) -> RdpResult<()> {
+pub fn cssp_connect<S: Read + Write>(link: &mut Link<S>, authentication_protocol: &mut dyn AuthenticationProtocol, restricted_admin_mode: bool, early_user_auth: bool) -> RdpResult<()> {
     // first step is to send the negotiate message from authentication protocol
     let negotiate_message = create_ts_request(authentication_protocol.create_negotiate_message()?);
     link.write(&negotiate_message)?;
@@ -189,7 +223,7 @@ pub fn cssp_connect<S: Read + Write>(link: &mut Link<S>, authentication_protocol
     let inc_pub_key = security_interface.gss_unwrapex(&(read_ts_validate(&(link.read(0)?))?))?;
 
     // Check possible man in the middle using cssp
-    if BigUint::from_bytes_le(&inc_pub_key) != BigUint::from_bytes_le(certificate.tbs_certificate.subject_pki.subject_public_key.data) + BigUint::new(vec![1]) {
+    if BigUint::from_bytes_le(&inc_pub_key) != BigUint::from_bytes_le(&certificate.tbs_certificate.subject_pki.subject_public_key.data) + BigUint::new(vec![1]) {
         return Err(Error::RdpError(RdpError::new(RdpErrorKind::PossibleMITM, "Man in the middle detected")))
     }
 
@@ -201,6 +235,12 @@ pub fn cssp_connect<S: Read + Write>(link: &mut Link<S>, authentication_protocol
 
     let credentials = create_ts_authinfo(security_interface.gss_wrapex(&create_ts_credentials(domain, user, password))?);
     link.write(&credentials)?;
+
+    // PROTOCOL_HYBRID_EX only: drain the Early User Authorization Result so it
+    // does not corrupt the next TPKT frame.
+    if early_user_auth {
+        read_early_user_auth(link)?;
+    }
 
     Ok(())
 }

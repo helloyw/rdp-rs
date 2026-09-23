@@ -217,8 +217,17 @@ impl<S: Read + Write> Client<S> {
         }
 
         Self::write_connection_request(&mut tpkt, security_protocols, Some(if restricted_admin_mode { RequestMode::RestrictedAdminModeRequired as u8} else { 0 }))?;
-        match Self::read_connection_confirm(&mut tpkt)? {
-            Protocols::ProtocolHybrid | Protocols::ProtocolHybridEx => Ok(Client::new(tpkt.start_nla(check_certificate, authentication_protocol.unwrap(), restricted_admin_mode || blank_creds)?,Protocols::ProtocolHybrid)),
+        let selected_protocol = Self::read_connection_confirm(&mut tpkt)?;
+        match selected_protocol {
+            Protocols::ProtocolHybrid | Protocols::ProtocolHybridEx => {
+                // Only PROTOCOL_HYBRID_EX makes the server send the 4 bytes
+                // Early User Authorization Result after the credentials.
+                let early_user_auth = matches!(selected_protocol, Protocols::ProtocolHybridEx);
+                // Keep the protocol the server actually selected: it is echoed back
+                // in the Client Core Data (serverSelectedProtocol) and a mismatch
+                // makes the server drop the MCS Connect Initial.
+                Ok(Client::new(tpkt.start_nla(check_certificate, authentication_protocol.unwrap(), restricted_admin_mode || blank_creds, early_user_auth)?, selected_protocol))
+            },
             Protocols::ProtocolSSL => Ok(Client::new(tpkt.start_ssl(check_certificate)?, Protocols::ProtocolSSL)),
             Protocols::ProtocolRDP => Ok(Client::new(tpkt, Protocols::ProtocolRDP)),
             _ => Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidProtocol, "Security protocol not handled")))
