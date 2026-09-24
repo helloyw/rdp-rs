@@ -684,6 +684,10 @@ impl Client {
     where T: FnMut(RdpEvent) {
         let mut data = Vec::new();
         stream.read_to_end(&mut data)?;
+        if std::env::var("RDP_FP_LOG").is_ok() {
+            let head: Vec<String> = data.iter().take(10).map(|b| format!("{:02x}", b)).collect();
+            eprintln!("[fp-pdu] len={} head={}", data.len(), head.join(","));
+        }
         let mut cursor = Cursor::new(data);
 
         while (cursor.position() as usize) < cursor.get_ref().len() {
@@ -707,6 +711,16 @@ impl Client {
             let mut size = U16::LE(0);
             if size.read(&mut cursor).is_err() {
                 break;
+            }
+            if std::env::var("RDP_FP_LOG").is_ok() {
+                eprintln!(
+                    "[fp] code={:#x} frag={} compression={} size={} remaining={}",
+                    update_code,
+                    fragmentation,
+                    compression,
+                    size.inner(),
+                    cursor.get_ref().len() - cursor.position() as usize
+                );
             }
             let mut update_data = vec![0u8; size.inner() as usize];
             if cursor.read_exact(&mut update_data).is_err() {

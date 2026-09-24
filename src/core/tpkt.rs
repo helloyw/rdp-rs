@@ -160,8 +160,16 @@ impl<S: Read + Write> Client<S> {
         } else {
             // fast path
             let sec_flag = (action >> 6) & 0x3;
-            let mut _short_length: u8 = 0;
-            _short_length.read(&mut buffer)?;
+            let mut short_length: u8 = 0;
+            short_length.read(&mut buffer)?;
+            if short_length & 0x80 != 0 {
+                // Long form: the length is 15 bits and spans two bytes. The
+                // link layer already used both bytes to bound the frame, so
+                // the second one must be stripped here too — otherwise every
+                // long (fast-path) payload is shifted by one byte.
+                let mut long_length: u8 = 0;
+                long_length.read(&mut buffer)?;
+            }
             let mut body = Vec::new();
             buffer.read_to_end(&mut body)?;
             Ok(Payload::FastPath(sec_flag, Cursor::new(body)))
