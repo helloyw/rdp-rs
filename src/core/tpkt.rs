@@ -2,6 +2,11 @@ use model::link::{Link};
 use model::data::{Message, U16, Component, Trame};
 use model::error::{RdpResult, RdpError, RdpErrorKind, Error};
 use std::io::{Cursor, Write, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// DEBUG: total bytes received on the wire
+pub static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub fn rx_bytes() -> u64 { RX_BYTES.load(Ordering::Relaxed) }
 use nla::cssp::cssp_connect;
 use nla::sspi::AuthenticationProtocol;
 
@@ -143,7 +148,9 @@ impl<S: Read + Write> Client<S> {
             }
             else {
                 // now wait for body
-                Ok(Payload::Raw(Cursor::new(self.transport.read(size.inner() as usize - 4)?)))
+                let body = self.transport.read(size.inner() as usize - 4)?;
+                RX_BYTES.fetch_add(size.inner() as u64, Ordering::Relaxed);
+                Ok(Payload::Raw(Cursor::new(body)))
             }
         } else {
             // fast path
@@ -158,14 +165,18 @@ impl<S: Read + Write> Client<S> {
                 if length < 3 {
                     Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, "Invalid minimal size for TPKT")))
                 } else {
-                    Ok(Payload::FastPath(sec_flag, Cursor::new(self.transport.read(length as usize - 3)?)))
+                    let b = self.transport.read(length as usize - 3)?;
+                    RX_BYTES.fetch_add(length as u64, Ordering::Relaxed);
+                    Ok(Payload::FastPath(sec_flag, Cursor::new(b)))
                 }
             }
             else {
                 if short_length < 2 {
                     Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, "Invalid minimal size for TPKT")))
                 } else {
-                    Ok(Payload::FastPath(sec_flag, Cursor::new(self.transport.read(short_length as usize - 2)?)))
+                    let b = self.transport.read(short_length as usize - 2)?;
+                    RX_BYTES.fetch_add(short_length as u64, Ordering::Relaxed);
+                    Ok(Payload::FastPath(sec_flag, Cursor::new(b)))
                 }
             }
          }

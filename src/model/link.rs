@@ -1,7 +1,7 @@
 extern crate native_tls;
 
 use model::error::{RdpResult, Error, RdpError, RdpErrorKind};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use self::native_tls::{TlsConnector, TlsStream, Certificate};
 use model::data::{Message};
 
@@ -157,8 +157,41 @@ impl<S: Read + Write> Link<S> {
             Ok(buffer)
         }
         else {
+            // A plain read_exact() must not be used here. Once a read timeout is
+            // installed on the socket a timeout landing in the middle of a
+            // message makes read_exact give up having already consumed part of
+            // it. Those bytes are lost, the TPKT stream desyncs and the parser
+            // ends up reading garbage lengths (which can even underflow into a
+            // huge allocation). So: give up only when nothing of the message has
+            // arrived yet, and otherwise keep waiting for the remainder.
             let mut buffer = vec![0; expected_size];
-            self.stream.read_exact(&mut buffer)?;
+            let mut filled = 0;
+            while filled < expected_size {
+                match self.stream.read(&mut buffer[filled..]) {
+                    Ok(0) => {
+                        return Err(Error::RdpError(RdpError::new(
+                            RdpErrorKind::InvalidData,
+                            "stream closed in the middle of a message",
+                        )))
+                    }
+                    Ok(size) => filled += size,
+                    Err(Error::Io(ref e))
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        if filled == 0 {
+                            // Nothing buffered: hand control back so the caller can
+                            // service queued input / rendering instead of blocking.
+                            let kind = e.kind();
+                            return Err(Error::Io(std::io::Error::new(
+                                kind,
+                                "no data available within the read timeout",
+                            )));
+                        }
+                        // Part of the message is already consumed, keep going.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Ok(buffer)
         }
     }
