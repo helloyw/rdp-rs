@@ -111,6 +111,9 @@ impl<S: Read + Write> RdpClient<S> {
             // Raw keyboard input
             RdpEvent::Key(key) => {
                 let mut flags: u16 = 0;
+                if key.extended {
+                    flags |= KeyboardFlag::KbdflagsExtended as u16;
+                }
                 if !key.down {
                     flags |= KeyboardFlag::KbdflagsRelease as u16;
                 }

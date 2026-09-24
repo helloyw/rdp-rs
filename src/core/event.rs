@@ -134,7 +134,30 @@ pub struct KeyboardEvent {
     /// Scancode of the key
     pub code: u16,
     /// State of the key
-    pub down: bool
+    pub down: bool,
+    /// True for extended keys (E0-prefixed scancodes: arrows, right Ctrl/Alt,
+    /// Insert/Delete/Home/End/PageUp/PageDown). Sent as KBD_FLAGS_EXTENDED.
+    pub extended: bool
+}
+
+/// A pointer shape received from the server (Color or New Pointer update).
+/// The AND mask is normalized to one byte per pixel (0 or 1) so consumers
+/// do not have to care about the 16/32-bit row padding rules.
+#[derive(Clone)]
+pub struct PointerShapeEvent {
+    /// Cache slot the server will refer to with a Cached Pointer update
+    pub cache_index: u16,
+    /// Hot spot (the pixel of the shape that sits on the pointer position)
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Bits per pixel of the XOR mask (16, 24 or 32)
+    pub bpp: u16,
+    /// AND mask, one byte per pixel, row major
+    pub and_mask: Vec<u8>,
+    /// XOR mask, raw pixel data in `bpp` format, row major
+    pub xor_mask: Vec<u8>
 }
 
 /// All event handle by RDP protocol implemented by rdp-rs
@@ -145,5 +168,18 @@ pub enum RdpEvent {
     /// Mouse event
     Pointer(PointerEvent),
     /// Keyboard event
-    Key(KeyboardEvent)
+    Key(KeyboardEvent),
+    /// The remote pointer moved to this position
+    PointerPosition {
+        x: u16,
+        y: u16
+    },
+    /// A new pointer shape is available, cache it under `cache_index`
+    PointerShape(PointerShapeEvent),
+    /// Switch the visible pointer to a previously cached shape
+    PointerCached(u16),
+    /// Switch back to the server default (arrow) pointer
+    PointerDefault,
+    /// Hide the remote pointer
+    PointerHidden
 }

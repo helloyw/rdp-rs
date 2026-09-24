@@ -3,7 +3,7 @@ use core::tpkt;
 use std::io::{Read, Write, Cursor};
 use model::error::{RdpResult, Error, RdpErrorKind, RdpError};
 use model::data::{Component, MessageOption, U32, DynOption, U16, DataType, Message, Array, Trame, Check, to_vec};
-use core::event::{RdpEvent, BitmapEvent};
+use core::event::{RdpEvent, BitmapEvent, PointerShapeEvent};
 use num_enum::TryFromPrimitive;
 use std::convert::TryFrom;
 use core::capability::{Capability, capability_set};
@@ -369,22 +369,15 @@ pub fn ts_keyboard_event(flags: Option<u16>, key_code: Option<u16>) -> TSInputEv
 /// Fast Path update (Not a PDU)
 ///
 /// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a1c4caa8-00ed-45bb-a06e-5177473766d3
-fn ts_fp_update() -> Component {
-    component![
-        "updateHeader" => DynOption::new(0 as u8, |header| {
-            if (header >> 4) & 0x2 as u8 == 0 as u8 {
-                MessageOption::SkipField("compressionFlags".to_string())
-            }
-            else {
-                MessageOption::None
-            }
-        }),
-        "compressionFlags" => 0 as u8,
-        "size" => DynOption::new(U16::LE(0), | size | MessageOption::Size("updateData".to_string(), size.inner() as usize)),
-        "updateData" => Vec::<u8>::new()
-    ]
-}
-
+///
+/// updateHeader layout (MS-RDPBCGR 2.2.9.1.2.1.1):
+///   bits 0-3  updateCode
+///   bits 4-5  fragmentation (0 SINGLE, 1 LAST, 2 FIRST, 3 NEXT)
+///   bits 6-7  compression (compressionFlags byte present iff != 0)
+const FASTPATH_FRAGMENT_SINGLE: u8 = 0;
+const FASTPATH_FRAGMENT_LAST: u8 = 1;
+const FASTPATH_FRAGMENT_FIRST: u8 = 2;
+const FASTPATH_FRAGMENT_NEXT: u8 = 3;
 
 #[repr(u8)]
 #[derive(Debug, TryFromPrimitive, Copy, Clone, Eq, PartialEq)]
@@ -401,27 +394,6 @@ enum FastPathUpdateType {
     FastpathUpdatetypeCached = 0xA,
     FastpathUpdatetypePointer = 0xB,
     Unknown
-}
-
-struct FastPathUpdate{
-    fp_type: FastPathUpdateType,
-    message: Component
-}
-
-impl FastPathUpdate {
-    /// Parse Fast Path update order
-    fn from_fp(fast_path: &Component) -> RdpResult<FastPathUpdate> {
-        let fp_update_type = FastPathUpdateType::try_from(cast!(DataType::U8, fast_path["updateHeader"])? & 0xf)?;
-        let mut result = match fp_update_type {
-            FastPathUpdateType::FastpathUpdatetypeBitmap => ts_fp_update_bitmap(),
-            FastPathUpdateType::FastpathUpdatetypeColor => ts_colorpointerattribute(),
-            FastPathUpdateType::FastpathUpdatetypeSynchronize => ts_fp_update_synchronize(),
-            FastPathUpdateType::FastpathUpdatetypePtrNull => ts_fp_systempointerhiddenattribute(),
-            _ => return Err(Error::RdpError(RdpError::new(RdpErrorKind::NotImplemented, &format!("GLOBAL: Fast Path parsing not implemented {:?}", fp_update_type))))
-        };
-        result.message.read(&mut Cursor::new(cast!(DataType::Slice, fast_path["updateData"])?))?;
-        Ok(result)
-    }
 }
 
 fn ts_cd_header() -> Component {
@@ -463,55 +435,59 @@ fn ts_bitmap_data() -> Component {
 }
 
 /// Fast Path bitmap update
-fn ts_fp_update_bitmap() -> FastPathUpdate {
-    FastPathUpdate {
-        fp_type: FastPathUpdateType::FastpathUpdatetypeBitmap,
-        message: component![
-            "header" => Check::new(U16::LE(FastPathUpdateType::FastpathUpdatetypeBitmap as u16)),
-            "numberRectangles" => U16::LE(0),
-            "rectangles" => Array::new(|| ts_bitmap_data())
-        ]
-    }
+fn ts_fp_update_bitmap() -> Component {
+    component![
+        "header" => Check::new(U16::LE(FastPathUpdateType::FastpathUpdatetypeBitmap as u16)),
+        "numberRectangles" => U16::LE(0),
+        "rectangles" => Array::new(|| ts_bitmap_data())
+    ]
 }
 
-/// A new pointer for mouse
+/// A color pointer for mouse (TS_COLORPOINTERATTRIBUTE)
 ///
 /// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/71fad4fc-6ad4-4c7f-8103-a442bebaf7d2
-fn ts_colorpointerattribute() -> FastPathUpdate {
-    FastPathUpdate {
-        fp_type: FastPathUpdateType::FastpathUpdatetypeColor,
-        message: component![
-            "cacheIndex " => U16::LE(0),
-            "hotSpot " => U32::LE(0),
-            "width" => U16::LE(0),
-            "height" => U16::LE(0),
-            "lengthAndMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("andMaskData".to_string(), length.inner() as usize)),
-            "lengthXorMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("xorMaskData".to_string(), length.inner() as usize)),
-            "xorMaskData" => Vec::<u8>::new(),
-            "andMaskData" => Vec::<u8>::new(),
-            "pad" => Some(0 as u8)
-         ]
-    }
+fn ts_colorpointerattribute() -> Component {
+    component![
+        "cacheIndex" => U16::LE(0),
+        "hotSpot" => U32::LE(0),
+        "width" => U16::LE(0),
+        "height" => U16::LE(0),
+        "lengthAndMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("andMaskData".to_string(), length.inner() as usize)),
+        "lengthXorMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("xorMaskData".to_string(), length.inner() as usize)),
+        "xorMaskData" => Vec::<u8>::new(),
+        "andMaskData" => Vec::<u8>::new()
+     ]
 }
 
-/// Empty fields
+/// A new pointer with explicit color depth (TS_POINTERATTRIBUTE)
 ///
-/// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/406dc477-c516-41cb-a8a0-ab4cc7119621
-fn ts_fp_update_synchronize() -> FastPathUpdate {
-    FastPathUpdate {
-        fp_type: FastPathUpdateType::FastpathUpdatetypeSynchronize,
-        message: component![]
-    }
+/// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/958c4af4-55c8-4eba-84d1-7d639a0de8e1
+fn ts_pointerattribute() -> Component {
+    component![
+        "cacheIndex" => U16::LE(0),
+        "hotSpot" => U32::LE(0),
+        "width" => U16::LE(0),
+        "height" => U16::LE(0),
+        "xorBpp" => U16::LE(0),
+        "lengthAndMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("andMaskData".to_string(), length.inner() as usize)),
+        "lengthXorMask" => DynOption::new(U16::LE(0), |length| MessageOption::Size("xorMaskData".to_string(), length.inner() as usize)),
+        "xorMaskData" => Vec::<u8>::new(),
+        "andMaskData" => Vec::<u8>::new()
+     ]
 }
 
-/// Empty fields
-///
-/// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/406dc477-c516-41cb-a8a0-ab4cc7119621
-fn ts_fp_systempointerhiddenattribute() -> FastPathUpdate {
-    FastPathUpdate {
-        fp_type: FastPathUpdateType::FastpathUpdatetypePtrNull,
-        message: component![]
+/// Expand a 1bpp AND mask (rows padded to `row_bytes`) into one byte per pixel
+fn normalize_and_mask(data: &[u8], width: u16, height: u16, row_bytes: usize) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let mut out = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            if let Some(byte) = data.get(y * row_bytes + x / 8) {
+                out[y * width + x] = (byte >> (7 - x % 8)) & 1;
+            }
+        }
     }
+    out
 }
 
 enum ClientState {
@@ -550,7 +526,11 @@ pub struct Client {
     /// Keep tracing of server capabilities
     server_capabilities: Vec<Capability>,
     /// Name send to the server
-    name: String
+    name: String,
+    /// Fast-path updates can be split across several PDUs (fragmentation
+    /// FIRST/NEXT/LAST). While a fragmented update is being reassembled this
+    /// holds its updateCode and the data received so far.
+    fastpath_fragment: Option<(u8, Vec<u8>)>
 }
 
 impl Client {
@@ -581,7 +561,8 @@ impl Client {
             width,
             height,
             layout,
-            name: String::from(name)
+            name: String::from(name),
+            fastpath_fragment: None
         }
     }
 
@@ -693,44 +674,181 @@ impl Client {
     /// Read fast path input data
     /// Reading is processed using a callback patterm
     /// This is where bitmap are received
+    ///
+    /// Updates are parsed manually (instead of the generic Array machinery)
+    /// because each element is length-delimited by its own `size` field: a
+    /// broken update can then be skipped without desynchronising the rest of
+    /// the PDU. Fragmented updates (FIRST/NEXT/LAST) are reassembled here,
+    /// statefully, since a single update may span several PDUs.
     fn read_fast_path<T>(&mut self, stream: &mut dyn Read, mut callback: T) -> RdpResult<()>
     where T: FnMut(RdpEvent) {
-        // it could be have one or more fast path payload
-        let mut fp_messages = Array::new(|| ts_fp_update());
-        fp_messages.read(stream)?;
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data)?;
+        let mut cursor = Cursor::new(data);
 
-        for fp_message in fp_messages.inner().iter() {
-            match FastPathUpdate::from_fp(cast!(DataType::Component, fp_message)?) {
-                Ok(order) => {
-                    match order.fp_type {
-                        FastPathUpdateType::FastpathUpdatetypeBitmap => {
-                            for rectangle in cast!(DataType::Trame, order.message["rectangles"])? {
-                                let bitmap = cast!(DataType::Component, rectangle)?;
-                                callback(RdpEvent::Bitmap(
-                                    BitmapEvent {
-                                        dest_left: cast!(DataType::U16, bitmap["destLeft"])?,
-                                        dest_top: cast!(DataType::U16, bitmap["destTop"])?,
-                                        dest_right: cast!(DataType::U16, bitmap["destRight"])?,
-                                        dest_bottom: cast!(DataType::U16, bitmap["destBottom"])?,
-                                        width: cast!(DataType::U16, bitmap["width"])?,
-                                        height: cast!(DataType::U16, bitmap["height"])?,
-                                        bpp: cast!(DataType::U16, bitmap["bitsPerPixel"])?,
-                                        is_compress: cast!(DataType::U16, bitmap["flags"])? & BitmapFlag::BitmapCompression as u16 != 0,
-                                        data: cast!(DataType::Slice, bitmap["bitmapDataStream"])?.to_vec()
-                                    }
-                                ));
-                            }
-                        },
-                        // do nothing
-                        FastPathUpdateType::FastpathUpdatetypeColor | FastPathUpdateType::FastpathUpdatetypePtrNull | FastPathUpdateType::FastpathUpdatetypeSynchronize => (),
-                        _ => println!("GLOBAL: Fast Path order not handled {:?}", order.fp_type)
+        while (cursor.position() as usize) < cursor.get_ref().len() {
+            let mut update_header = 0u8;
+            if update_header.read(&mut cursor).is_err() {
+                break;
+            }
+            let update_code = update_header & 0x0f;
+            let fragmentation = (update_header >> 4) & 0x03;
+            let compression = (update_header >> 6) & 0x03;
+
+            // compressionFlags is present iff the compression field is non-zero
+            // (MS-RDPBCGR 2.2.9.1.2.1.1). It used to be keyed off the
+            // fragmentation bits, which shifted every compressed or fragmented
+            // update by one byte and corrupted the rest of the PDU.
+            if compression != 0 {
+                let mut _compression_flags = 0u8;
+                let _ = _compression_flags.read(&mut cursor);
+            }
+
+            let mut size = U16::LE(0);
+            if size.read(&mut cursor).is_err() {
+                break;
+            }
+            let mut update_data = vec![0u8; size.inner() as usize];
+            if cursor.read_exact(&mut update_data).is_err() {
+                // Truncated PDU: drop the remainder of this frame only.
+                eprintln!("GLOBAL: truncated fast path update ({} bytes expected)", size.inner());
+                break;
+            }
+
+            match fragmentation {
+                FASTPATH_FRAGMENT_SINGLE => self.dispatch_fastpath_update(update_code, &update_data, &mut callback),
+                FASTPATH_FRAGMENT_FIRST => {
+                    self.fastpath_fragment = Some((update_code, update_data));
+                },
+                FASTPATH_FRAGMENT_NEXT => {
+                    if let Some((_, ref mut buffer)) = self.fastpath_fragment {
+                        buffer.extend_from_slice(&update_data);
                     }
                 },
-                Err(e) => println!("GLOBAL: Unknown Fast Path order {:?}", e)
-            };
+                FASTPATH_FRAGMENT_LAST => {
+                    if let Some((code, mut buffer)) = self.fastpath_fragment.take() {
+                        buffer.extend_from_slice(&update_data);
+                        self.dispatch_fastpath_update(code, &buffer, &mut callback);
+                    }
+                },
+                _ => unreachable!()
+            }
         }
 
         Ok(())
+    }
+
+    /// Parse one reassembled fast path update and emit events for it
+    fn dispatch_fastpath_update<T>(&mut self, update_code: u8, data: &[u8], callback: &mut T)
+    where T: FnMut(RdpEvent) {
+        let fp_update_type = match FastPathUpdateType::try_from(update_code) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("GLOBAL: unknown fast path update code {:#x}", update_code);
+                return;
+            }
+        };
+
+        let result = match fp_update_type {
+            FastPathUpdateType::FastpathUpdatetypeBitmap => {
+                let mut message = ts_fp_update_bitmap();
+                message.read(&mut Cursor::new(data)).map(|_| {
+                    if let Ok(rectangles) = cast!(DataType::Trame, message["rectangles"]) {
+                        for rectangle in rectangles.iter() {
+                        if let Ok(bitmap) = cast!(DataType::Component, rectangle) {
+                            callback(RdpEvent::Bitmap(
+                                BitmapEvent {
+                                    dest_left: cast!(DataType::U16, bitmap["destLeft"]).unwrap_or(0),
+                                    dest_top: cast!(DataType::U16, bitmap["destTop"]).unwrap_or(0),
+                                    dest_right: cast!(DataType::U16, bitmap["destRight"]).unwrap_or(0),
+                                    dest_bottom: cast!(DataType::U16, bitmap["destBottom"]).unwrap_or(0),
+                                    width: cast!(DataType::U16, bitmap["width"]).unwrap_or(0),
+                                    height: cast!(DataType::U16, bitmap["height"]).unwrap_or(0),
+                                    bpp: cast!(DataType::U16, bitmap["bitsPerPixel"]).unwrap_or(0),
+                                    is_compress: cast!(DataType::U16, bitmap["flags"]).unwrap_or(0) & BitmapFlag::BitmapCompression as u16 != 0,
+                                    data: cast!(DataType::Slice, bitmap["bitmapDataStream"]).unwrap_or(&[]).to_vec()
+                                }
+                            ));
+                        }
+                        }
+                    }
+                })
+            },
+            FastPathUpdateType::FastpathUpdatetypeColor => {
+                let mut message = ts_colorpointerattribute();
+                message.read(&mut Cursor::new(data)).map(|_| {
+                    let width = cast!(DataType::U16, message["width"]).unwrap_or(0);
+                    let height = cast!(DataType::U16, message["height"]).unwrap_or(0);
+                    let hot_spot = cast!(DataType::U32, message["hotSpot"]).unwrap_or(0);
+                    callback(RdpEvent::PointerShape(PointerShapeEvent {
+                        cache_index: cast!(DataType::U16, message["cacheIndex"]).unwrap_or(0),
+                        hot_x: (hot_spot & 0xffff) as u16,
+                        hot_y: (hot_spot >> 16) as u16,
+                        width,
+                        height,
+                        // Color pointer XOR data is always 24bpp
+                        bpp: 24,
+                        // Color pointer AND mask rows are padded to 16 bits
+                        and_mask: normalize_and_mask(cast!(DataType::Slice, message["andMaskData"]).unwrap_or(&[]), width, height, ((width as usize + 15) / 16) * 2),
+                        xor_mask: cast!(DataType::Slice, message["xorMaskData"]).unwrap_or(&[]).to_vec()
+                    }));
+                })
+            },
+            FastPathUpdateType::FastpathUpdatetypePointer => {
+                let mut message = ts_pointerattribute();
+                message.read(&mut Cursor::new(data)).map(|_| {
+                    let width = cast!(DataType::U16, message["width"]).unwrap_or(0);
+                    let height = cast!(DataType::U16, message["height"]).unwrap_or(0);
+                    let hot_spot = cast!(DataType::U32, message["hotSpot"]).unwrap_or(0);
+                    callback(RdpEvent::PointerShape(PointerShapeEvent {
+                        cache_index: cast!(DataType::U16, message["cacheIndex"]).unwrap_or(0),
+                        hot_x: (hot_spot & 0xffff) as u16,
+                        hot_y: (hot_spot >> 16) as u16,
+                        width,
+                        height,
+                        bpp: cast!(DataType::U16, message["xorBpp"]).unwrap_or(0),
+                        // New pointer AND mask rows are padded to 32 bits
+                        and_mask: normalize_and_mask(cast!(DataType::Slice, message["andMaskData"]).unwrap_or(&[]), width, height, ((width as usize + 31) / 32) * 4),
+                        xor_mask: cast!(DataType::Slice, message["xorMaskData"]).unwrap_or(&[]).to_vec()
+                    }));
+                })
+            },
+            FastPathUpdateType::FastpathUpdatetypeCached => {
+                // TS_CACHEDPOINTERATTRIBUTE: just a cache index
+                let mut cache_index = U16::LE(0);
+                let _ = cache_index.read(&mut Cursor::new(data));
+                callback(RdpEvent::PointerCached(cache_index.inner()));
+                Ok(())
+            },
+            FastPathUpdateType::FastpathUpdatetypePtrDefault => {
+                callback(RdpEvent::PointerDefault);
+                Ok(())
+            },
+            FastPathUpdateType::FastpathUpdatetypePtrNull => {
+                callback(RdpEvent::PointerHidden);
+                Ok(())
+            },
+            FastPathUpdateType::FastpathUpdatetypePtrPosition => {
+                // TS_FP_PTR_POSITION: position as two u16
+                let mut position = U32::LE(0);
+                let _ = position.read(&mut Cursor::new(data));
+                let p = position.inner();
+                callback(RdpEvent::PointerPosition { x: (p & 0xffff) as u16, y: (p >> 16) as u16 });
+                Ok(())
+            },
+            FastPathUpdateType::FastpathUpdatetypeSynchronize => Ok(()),
+            FastPathUpdateType::FastpathUpdatetypeOrders
+            | FastPathUpdateType::FastpathUpdatetypePalette
+            | FastPathUpdateType::FastpathUpdatetypeSurfcmds
+            | FastPathUpdateType::Unknown => {
+                eprintln!("GLOBAL: Fast Path update not handled {:?}", fp_update_type);
+                Ok(())
+            }
+        };
+
+        if let Err(e) = result {
+            eprintln!("GLOBAL: Fast Path update parse error {:?}: {:?}", fp_update_type, e);
+        }
     }
 
     /// Write confirm active pdu
@@ -925,5 +1043,109 @@ mod test {
         let mut stream = Cursor::new(vec![26, 0, 23, 0, 234, 3, 234, 3, 1, 0, 0, 2, 26, 0, 40, 0, 0, 0, 0, 0, 0, 0, 3, 0, 4, 0]);
         let mut global = Client::new(0,0, 800, 600, KeyboardLayout::US, "foo");
         assert!(global.read_font_map_pdu(&mut stream).unwrap())
+    }
+
+    /// Build the updateData of a single-rectangle 16bpp uncompressed bitmap update
+    fn bitmap_update_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes()); // updateHeader
+        body.extend_from_slice(&1u16.to_le_bytes()); // numberRectangles
+        body.extend_from_slice(&10u16.to_le_bytes()); // destLeft
+        body.extend_from_slice(&20u16.to_le_bytes()); // destTop
+        body.extend_from_slice(&13u16.to_le_bytes()); // destRight
+        body.extend_from_slice(&23u16.to_le_bytes()); // destBottom
+        body.extend_from_slice(&4u16.to_le_bytes()); // width
+        body.extend_from_slice(&4u16.to_le_bytes()); // height
+        body.extend_from_slice(&16u16.to_le_bytes()); // bitsPerPixel
+        body.extend_from_slice(&0x0400u16.to_le_bytes()); // flags: NoBitmapCompressionHdr
+        body.extend_from_slice(&32u16.to_le_bytes()); // bitmapLength = 4*4*2
+        body.extend_from_slice(&[0xAA; 32]);
+        body
+    }
+
+    fn wrap_update(header: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![header];
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn collect_bitmap_events(global: &mut Client, payload: &[u8]) -> Vec<BitmapEvent> {
+        let mut events = Vec::new();
+        global.read_fast_path(&mut Cursor::new(payload.to_vec()), |e| {
+            if let RdpEvent::Bitmap(b) = e {
+                events.push(b);
+            }
+        }).unwrap();
+        events
+    }
+
+    /// A SINGLE bitmap update parses and emits one bitmap event
+    #[test]
+    fn test_fastpath_single_bitmap() {
+        let mut global = Client::new(0, 0, 800, 600, KeyboardLayout::US, "foo");
+        let payload = wrap_update(0x01, &bitmap_update_body());
+        let events = collect_bitmap_events(&mut global, &payload);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].dest_left, 10);
+        assert_eq!(events[0].dest_top, 20);
+        assert_eq!(events[0].width, 4);
+        assert_eq!(events[0].bpp, 16);
+        assert_eq!(events[0].data, vec![0xAA; 32]);
+    }
+
+    /// A bitmap update split in FIRST/NEXT/LAST fragments across two PDUs is
+    /// reassembled and emitted exactly once, with the FIRST fragment's type
+    #[test]
+    fn test_fastpath_fragmented_bitmap() {
+        let mut global = Client::new(0, 0, 800, 600, KeyboardLayout::US, "foo");
+        let body = bitmap_update_body();
+        let (first, rest) = body.split_at(7);
+        let (next, last) = rest.split_at(10);
+
+        let mut pdu1 = wrap_update(0x21, first); // type Bitmap, FIRST
+        assert!(collect_bitmap_events(&mut global, &pdu1).is_empty());
+
+        let mut pdu2 = wrap_update(0x31, next); // NEXT (type bits ignored)
+        pdu2.extend_from_slice(&wrap_update(0x11, last)); // LAST
+        let events = collect_bitmap_events(&mut global, &pdu2);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].dest_left, 10);
+        assert_eq!(events[0].data, vec![0xAA; 32]);
+        assert!(global.fastpath_fragment.is_none());
+    }
+
+    /// compressionFlags is consumed iff the compression field (bits 6-7) is
+    /// set — never because of the fragmentation bits
+    #[test]
+    fn test_fastpath_compression_flags_field() {
+        let mut global = Client::new(0, 0, 800, 600, KeyboardLayout::US, "foo");
+        // Fragmentation FIRST without compression: no compressionFlags byte
+        let body = bitmap_update_body();
+        let mut all = vec![0x21];
+        all.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        all.extend_from_slice(&body);
+        // LAST fragment completing it (zero-length piece)
+        all.extend_from_slice(&[0x11, 0x00, 0x00]);
+        let events = collect_bitmap_events(&mut global, &all);
+        assert_eq!(events.len(), 1);
+    }
+
+    /// PtrPosition emits a PointerPosition event with the coordinates
+    #[test]
+    fn test_fastpath_pointer_position() {
+        let mut global = Client::new(0, 0, 800, 600, KeyboardLayout::US, "foo");
+        let mut data = Vec::new();
+        data.extend_from_slice(&300u16.to_le_bytes());
+        data.extend_from_slice(&200u16.to_le_bytes());
+        let payload = wrap_update(0x08, &data);
+
+        let mut pos = None;
+        global.read_fast_path(&mut Cursor::new(payload), |e| {
+            if let RdpEvent::PointerPosition { x, y } = e {
+                pos = Some((x, y));
+            }
+        }).unwrap();
+        assert_eq!(pos, Some((300, 200)));
     }
 }

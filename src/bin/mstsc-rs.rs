@@ -412,7 +412,8 @@ fn main_gui_loop<S: Read + Write>(
                     rdp_client_guard.try_write(RdpEvent::Key(
                         KeyboardEvent {
                             code: to_scancode(*key),
-                            down: false
+                            down: false,
+                            extended: false
                         })
                     )?
                 }
@@ -423,7 +424,8 @@ fn main_gui_loop<S: Read + Write>(
                     rdp_client_guard.try_write(RdpEvent::Key(
                         KeyboardEvent {
                             code: to_scancode(*key),
-                            down: true
+                            down: true,
+                            extended: false
                         })
                     )?
                 }

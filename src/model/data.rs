@@ -430,6 +430,12 @@ impl Message for Component {
             }
 
             if dynamic_size.contains_key(name) {
+                // Never trust a length taken from the wire: a desynchronised
+                // stream used to turn `totalLength - 6` into a ~1.8e19 usize
+                // and abort the process on a huge allocation.
+                if dynamic_size[name] > 64 * 1024 * 1024 {
+                    return Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, &format!("Component field {} exceeds the 64 MB sanity bound", name))));
+                }
                 let mut local =vec![0; dynamic_size[name]];
                 reader.read_exact(&mut local)?;
                 value.read(&mut Cursor::new(local))?;
