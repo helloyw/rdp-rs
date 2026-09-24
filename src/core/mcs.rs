@@ -271,10 +271,11 @@ impl<S: Read + Write> Client<S> {
     /// ```
     pub fn write<T: 'static>(&mut self, channel_name: &String, message: T) -> RdpResult<()>
     where T: Message {
+        let channel_id = *self.channel_ids.get(channel_name).ok_or(Error::RdpError(RdpError::new(RdpErrorKind::Unknown, &format!("MCS: unknown channel {:?}", channel_name))))?;
         self.x224.write(trame![
             mcs_pdu_header(Some(DomainMCSPDU::SendDataRequest), None),
             U16::BE(self.user_id.unwrap() - 1001),
-            U16::BE(self.channel_ids[channel_name]),
+            U16::BE(channel_id),
             0x70 as u8,
             per::write_length(message.length() as u16)?,
             message
