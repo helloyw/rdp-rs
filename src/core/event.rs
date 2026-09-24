@@ -8,6 +8,7 @@ use codec::rle::{rle_32_decompress, rle_16_decompress, rgb565torgb32};
 ///
 /// If bitmap is compress you can use the
 /// decompress function to handle it
+#[derive(Clone)]
 pub struct BitmapEvent {
     /// Pixel position from left of the left top angle
     pub dest_left: u16,
@@ -113,6 +114,7 @@ pub enum PointerButton {
 }
 
 /// A mouse pointer event
+#[derive(Clone)]
 pub struct PointerEvent {
     /// horizontal position from top left angle of the window
     pub x: u16,
@@ -127,6 +129,7 @@ pub struct PointerEvent {
 /// Keyboard event
 /// It's a raw event using Scancode
 /// to inform which key is pressed
+#[derive(Clone)]
 pub struct KeyboardEvent {
     /// Scancode of the key
     pub code: u16,
@@ -135,6 +138,7 @@ pub struct KeyboardEvent {
 }
 
 /// All event handle by RDP protocol implemented by rdp-rs
+#[derive(Clone)]
 pub enum RdpEvent {
     /// Classic bitmap event
     Bitmap(BitmapEvent),
