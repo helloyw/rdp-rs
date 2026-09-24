@@ -160,6 +160,60 @@ pub struct PointerShapeEvent {
     pub xor_mask: Vec<u8>
 }
 
+/// A clipboard format announcement (CLIPRDR)
+#[derive(Clone)]
+pub struct ClipboardFormat {
+    /// Windows clipboard format id (CF_* or registered 0xC000+)
+    pub id: u32,
+    /// Registered format name, empty for standard formats
+    pub name: String
+}
+
+/// A FileContents request (CLIPRDR)
+#[derive(Clone)]
+pub struct FileContentsRequest {
+    pub stream_id: u32,
+    /// Index into the FileGroupDescriptorW file list
+    pub index: u32,
+    /// FILECONTENTS_SIZE (0x1) or FILECONTENTS_RANGE (0x2)
+    pub flags: u32,
+    pub position: u64,
+    pub size: u32
+}
+
+/// All events of the clipboard virtual channel (CLIPRDR)
+///
+/// The same enum is used for both directions: events emitted by `read()`
+/// come from the server, events passed to `RdpClient::write()` go to it.
+#[derive(Clone)]
+pub enum ClipboardEvent {
+    /// CB_MONITOR_READY: the server is ready, the client should now announce
+    /// its formats (write `FormatList`)
+    MonitorReady,
+    /// CB_FORMAT_LIST: clipboard content changed (remote side when read,
+    /// local announcement when written)
+    FormatList(Vec<ClipboardFormat>),
+    /// CB_FORMAT_LIST_RESPONSE
+    FormatListResponse,
+    /// CB_FORMAT_DATA_REQUEST: ask for the data of a format
+    DataRequest {
+        format_id: u32
+    },
+    /// CB_FORMAT_DATA_RESPONSE: the requested data. `format_id` is filled in
+    /// by the protocol layer from the matching request.
+    DataResponse {
+        format_id: u32,
+        data: Vec<u8>
+    },
+    /// CB_FILECONTENTS_REQUEST
+    FileContentsRequest(FileContentsRequest),
+    /// CB_FILECONTENTS_RESPONSE
+    FileContentsResponse {
+        stream_id: u32,
+        data: Vec<u8>
+    }
+}
+
 /// All event handle by RDP protocol implemented by rdp-rs
 #[derive(Clone)]
 pub enum RdpEvent {
@@ -181,5 +235,7 @@ pub enum RdpEvent {
     /// Switch back to the server default (arrow) pointer
     PointerDefault,
     /// Hide the remote pointer
-    PointerHidden
+    PointerHidden,
+    /// Clipboard virtual channel event
+    Clipboard(ClipboardEvent)
 }

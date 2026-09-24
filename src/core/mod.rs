@@ -9,3 +9,4 @@ pub mod license;
 pub mod global;
 pub mod capability;
 pub mod event;
+pub mod cliprdr;

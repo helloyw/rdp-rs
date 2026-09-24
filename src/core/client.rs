@@ -4,10 +4,11 @@ use core::mcs;
 use core::tpkt;
 use core::sec;
 use core::global;
+use core::cliprdr;
 use std::io::{Read, Write};
 use model::error::{RdpResult, Error, RdpError, RdpErrorKind};
 use model::link::{Link, Stream};
-use core::event::{RdpEvent, PointerButton};
+use core::event::{RdpEvent, PointerButton, ClipboardEvent};
 use core::global::{ts_pointer_event, PointerFlag, ts_keyboard_event, KeyboardFlag};
 use nla::ntlm::Ntlm;
 
@@ -26,7 +27,9 @@ pub struct RdpClient<S> {
     /// This is the main switch layer of the protocol
     mcs: mcs::Client<S>,
     /// Global channel that implement the basic layer
-    global: global::Client
+    global: global::Client,
+    /// Clipboard virtual channel
+    cliprdr: cliprdr::Client
 }
 
 impl<S: Read + Write> RdpClient<S> {
@@ -59,6 +62,7 @@ impl<S: Read + Write> RdpClient<S> {
         let (channel_name, message) = self.mcs.read()?;
         match channel_name.as_str() {
             "global" => self.global.read(message, &mut self.mcs, callback),
+            "cliprdr" => self.cliprdr.read(message, &mut self.mcs, callback),
             _ => Err(Error::RdpError(RdpError::new(RdpErrorKind::UnexpectedType, &format!("Invalid channel name {:?}", channel_name))))
         }
     }
@@ -118,6 +122,10 @@ impl<S: Read + Write> RdpClient<S> {
                     flags |= KeyboardFlag::KbdflagsRelease as u16;
                 }
                 self.global.write_input_event(ts_keyboard_event(Some(flags), Some(key.code)), &mut self.mcs)
+            },
+            // Clipboard virtual channel
+            RdpEvent::Clipboard(event) => {
+                self.cliprdr.write(event, &mut self.mcs)
             }
             _ => Err(Error::RdpError(RdpError::new(RdpErrorKind::UnexpectedType, "RDPCLIENT: This event can't be sent")))
         }
@@ -287,7 +295,8 @@ impl Connector {
 
         Ok(RdpClient {
             mcs,
-            global
+            global,
+            cliprdr: cliprdr::Client::new()
         })
     }
 

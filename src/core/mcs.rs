@@ -1,7 +1,7 @@
 use core::x224;
 use core::tpkt;
 use model::error::{RdpResult, Error, RdpError, RdpErrorKind};
-use core::gcc::{KeyboardLayout, client_core_data, ClientData, ServerData, client_security_data, client_network_data, block_header, write_conference_create_request, MessageType, read_conference_create_response, Version};
+use core::gcc::{KeyboardLayout, client_core_data, ClientData, ServerData, client_security_data, client_network_data, block_header, write_conference_create_request, MessageType, read_conference_create_response, Version, channel_def};
 use model::data::{Trame, to_vec, Message, DataType, U16};
 use nla::asn1::{Sequence, ImplicitTag, OctetString, Enumerate, ASN1Type, Integer, to_der, from_ber};
 use yasna::{Tag};
@@ -190,7 +190,9 @@ impl<S: Read + Write> Client<S> {
             name: client_name
         }));
         let client_security_data = client_security_data();
-        let client_network_data = client_network_data(trame![]);
+        // Request the clipboard virtual channel (CLIPRDR) in addition to the
+        // two static channels below.
+        let client_network_data = client_network_data(trame![channel_def(&"cliprdr".to_string(), 0)]);
         let user_data = to_vec(&trame![
             trame![block_header(Some(MessageType::CsCore), Some(client_core_data.length() as u16)), client_core_data],
             trame![block_header(Some(MessageType::CsSecurity), Some(client_security_data.length() as u16)), client_security_data],
@@ -235,8 +237,18 @@ impl<S: Read + Write> Client<S> {
         self.channel_ids.insert("global".to_string(), 1003);
         self.channel_ids.insert("user".to_string(), self.user_id.unwrap());
 
+        // Map the server-assigned id of the declared virtual channels
+        // (cliprdr was the only channel requested in client network data,
+        // so it is the first — and only — id in the response array).
+        if let Some(server_data) = &self.server_data {
+            if let Some(cliprdr_id) = server_data.channel_ids.first() {
+                self.channel_ids.insert("cliprdr".to_string(), *cliprdr_id);
+            } else {
+                println!("MCS: server did not assign a channel id to cliprdr, clipboard disabled");
+            }
+        }
+
         // Create list of requested channels
-        // Actually only the two static main channel are requested
         for channel_id in self.channel_ids.values() {
             self.x224.write(channel_join_request(self.user_id, Some(*channel_id))?)?;
             if !read_channel_join_confirm(self.user_id.unwrap(), *channel_id, &mut try_let!(tpkt::Payload::Raw, self.x224.read()?)?)? {
