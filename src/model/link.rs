@@ -88,7 +88,11 @@ impl<S: Read + Write> Stream<S> {
 /// Link layer is a wrapper around TCP or SSL stream
 /// It can swicth from TCP to SSL
 pub struct Link<S> {
-    stream: Stream<S>
+    stream: Stream<S>,
+    /// Bytes already pulled off the socket that do not yet form a complete
+    /// frame. Keeping them here is what makes frame reading resumable: a socket
+    /// read timeout can never split a frame any more.
+    pending: Vec<u8>
 }
 
 impl<S: Read + Write> Link<S> {
@@ -105,7 +109,8 @@ impl<S: Read + Write> Link<S> {
     /// ```
     pub fn new(stream: Stream<S>) -> Self {
         Link {
-            stream
+            stream,
+            pending: Vec::new()
         }
     }
 
@@ -157,42 +162,108 @@ impl<S: Read + Write> Link<S> {
             Ok(buffer)
         }
         else {
-            // A plain read_exact() must not be used here. Once a read timeout is
-            // installed on the socket a timeout landing in the middle of a
-            // message makes read_exact give up having already consumed part of
-            // it. Those bytes are lost, the TPKT stream desyncs and the parser
-            // ends up reading garbage lengths (which can even underflow into a
-            // huge allocation). So: give up only when nothing of the message has
-            // arrived yet, and otherwise keep waiting for the remainder.
+            // Only the CredSSP handshake uses this, and it runs before any
+            // socket read timeout is installed, so blocking here is correct.
             let mut buffer = vec![0; expected_size];
-            let mut filled = 0;
-            while filled < expected_size {
-                match self.stream.read(&mut buffer[filled..]) {
-                    Ok(0) => {
-                        return Err(Error::RdpError(RdpError::new(
-                            RdpErrorKind::InvalidData,
-                            "stream closed in the middle of a message",
-                        )))
-                    }
-                    Ok(size) => filled += size,
-                    Err(Error::Io(ref e))
-                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                    {
-                        if filled == 0 {
-                            // Nothing buffered: hand control back so the caller can
-                            // service queued input / rendering instead of blocking.
-                            let kind = e.kind();
-                            return Err(Error::Io(std::io::Error::new(
-                                kind,
-                                "no data available within the read timeout",
-                            )));
-                        }
-                        // Part of the message is already consumed, keep going.
-                    }
-                    Err(e) => return Err(e),
+            self.stream.read_exact(&mut buffer)?;
+            Ok(buffer)
+        }
+    }
+
+    /// Decide the total size of the frame sitting at the head of `pending`.
+    /// `Ok(None)` means more bytes are needed before that can be known.
+    fn pending_frame_size(pending: &[u8]) -> RdpResult<Option<usize>> {
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        if pending[0] == 0x03 {
+            // TPKT: version, reserved, then a 16 bit big endian total length.
+            if pending.len() < 4 {
+                return Ok(None);
+            }
+            let total = u16::from_be_bytes([pending[2], pending[3]]) as usize;
+            if total < 4 {
+                return Err(Error::RdpError(RdpError::new(
+                    RdpErrorKind::InvalidSize,
+                    "Invalid minimal size for TPKT",
+                )));
+            }
+            Ok(Some(total))
+        } else {
+            // Fast path: the length is carried by the byte after the header.
+            if pending.len() < 2 {
+                return Ok(None);
+            }
+            let short = pending[1];
+            if short & 0x80 != 0 {
+                if pending.len() < 3 {
+                    return Ok(None);
+                }
+                let total = (((short & 0x7f) as usize) << 8) | pending[2] as usize;
+                if total < 3 {
+                    return Err(Error::RdpError(RdpError::new(
+                        RdpErrorKind::InvalidSize,
+                        "Invalid minimal size for TPKT",
+                    )));
+                }
+                Ok(Some(total))
+            } else {
+                if (short as usize) < 2 {
+                    return Err(Error::RdpError(RdpError::new(
+                        RdpErrorKind::InvalidSize,
+                        "Invalid minimal size for TPKT",
+                    )));
+                }
+                Ok(Some(short as usize))
+            }
+        }
+    }
+
+    fn take_pending_frame(&mut self, total: usize) -> Vec<u8> {
+        let rest = self.pending.split_off(total);
+        std::mem::replace(&mut self.pending, rest)
+    }
+
+    /// Assemble exactly one complete TPKT or fast path frame.
+    ///
+    /// Bytes that do not yet form a complete frame stay buffered and the call
+    /// reports a timeout instead of blocking. That matters twice over: a socket
+    /// read timeout can no longer split a frame (which used to silently drop
+    /// bytes and desynchronise the whole stream) while the caller still gets
+    /// control back regularly to flush queued input.
+    pub fn read_frame(&mut self) -> RdpResult<Vec<u8>> {
+        loop {
+            if let Some(total) = Self::pending_frame_size(&self.pending)? {
+                if self.pending.len() >= total {
+                    return Ok(self.take_pending_frame(total));
                 }
             }
-            Ok(buffer)
+
+            let mut chunk = [0u8; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(Error::RdpError(RdpError::new(
+                        RdpErrorKind::InvalidData,
+                        "stream closed while reading a frame",
+                    )))
+                }
+                Ok(size) => self.pending.extend_from_slice(&chunk[..size]),
+                Err(Error::Io(ref e))
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                {
+                    if let Some(total) = Self::pending_frame_size(&self.pending)? {
+                        if self.pending.len() >= total {
+                            return Ok(self.take_pending_frame(total));
+                        }
+                    }
+                    let kind = e.kind();
+                    return Err(Error::Io(std::io::Error::new(
+                        kind,
+                        "incomplete frame, received bytes are kept buffered",
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 

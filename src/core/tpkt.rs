@@ -127,17 +127,22 @@ impl<S: Read + Write> Client<S> {
     /// }
     /// ```
     pub fn read(&mut self) -> RdpResult<Payload> {
-        let mut buffer = Cursor::new(self.transport.read(2)?);
+        // Fetch one complete frame. The link layer assembles it without ever
+        // splitting it across a socket read timeout, and keeps whatever is
+        // incomplete buffered so nothing is lost and control still comes back
+        // regularly to flush queued input.
+        let frame = self.transport.read_frame()?;
+        RX_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
+
+        let mut buffer = Cursor::new(frame);
         let mut action: u8 = 0;
         action.read(&mut buffer)?;
+
         if action == Action::FastPathActionX224 as u8 {
 
             // read padding
             let mut padding: u8 = 0;
             padding.read(&mut buffer)?;
-            // now wait extended header
-            buffer = Cursor::new(self.transport.read(2)?);
-
             let mut size = U16::BE(0);
             size.read(&mut buffer)?;
 
@@ -147,39 +152,20 @@ impl<S: Read + Write> Client<S> {
                 Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, "Invalid minimal size for TPKT")))
             }
             else {
-                // now wait for body
-                let body = self.transport.read(size.inner() as usize - 4)?;
-                RX_BYTES.fetch_add(size.inner() as u64, Ordering::Relaxed);
+                // the body is what is left of the frame
+                let mut body = Vec::new();
+                buffer.read_to_end(&mut body)?;
                 Ok(Payload::Raw(Cursor::new(body)))
             }
         } else {
             // fast path
             let sec_flag = (action >> 6) & 0x3;
-            let mut short_length: u8 = 0;
-            short_length.read(&mut buffer)?;
-            if short_length & 0x80 != 0 {
-                let mut hi_length: u8 = 0;
-                hi_length.read(&mut Cursor::new(self.transport.read(1)?))?;
-                let length: u16 = ((short_length & !0x80) as u16) << 8;
-                let length = length | hi_length as u16;
-                if length < 3 {
-                    Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, "Invalid minimal size for TPKT")))
-                } else {
-                    let b = self.transport.read(length as usize - 3)?;
-                    RX_BYTES.fetch_add(length as u64, Ordering::Relaxed);
-                    Ok(Payload::FastPath(sec_flag, Cursor::new(b)))
-                }
-            }
-            else {
-                if short_length < 2 {
-                    Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidSize, "Invalid minimal size for TPKT")))
-                } else {
-                    let b = self.transport.read(short_length as usize - 2)?;
-                    RX_BYTES.fetch_add(short_length as u64, Ordering::Relaxed);
-                    Ok(Payload::FastPath(sec_flag, Cursor::new(b)))
-                }
-            }
-         }
+            let mut _short_length: u8 = 0;
+            _short_length.read(&mut buffer)?;
+            let mut body = Vec::new();
+            buffer.read_to_end(&mut body)?;
+            Ok(Payload::FastPath(sec_flag, Cursor::new(body)))
+        }
     }
 
     /// This function transform the link layer with
