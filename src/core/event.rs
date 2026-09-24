@@ -161,7 +161,7 @@ pub struct PointerShapeEvent {
 }
 
 /// A clipboard format announcement (CLIPRDR)
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClipboardFormat {
     /// Windows clipboard format id (CF_* or registered 0xC000+)
     pub id: u32,
@@ -170,7 +170,7 @@ pub struct ClipboardFormat {
 }
 
 /// A FileContents request (CLIPRDR)
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FileContentsRequest {
     pub stream_id: u32,
     /// Index into the FileGroupDescriptorW file list

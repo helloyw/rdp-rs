@@ -8,7 +8,7 @@ use core::cliprdr;
 use std::io::{Read, Write};
 use model::error::{RdpResult, Error, RdpError, RdpErrorKind};
 use model::link::{Link, Stream};
-use core::event::{RdpEvent, PointerButton, ClipboardEvent};
+use core::event::{RdpEvent, PointerButton};
 use core::global::{ts_pointer_event, PointerFlag, ts_keyboard_event, KeyboardFlag};
 use nla::ntlm::Ntlm;
 
