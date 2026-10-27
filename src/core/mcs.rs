@@ -22,6 +22,19 @@ enum DomainMCSPDU {
     SendDataIndication = 26
 }
 
+/// CHANNEL_PDU_HEADER flags, MS-RDPBCGR 2.2.6.1
+const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
+const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
+/// Tells the server the PDU carries a CHANNEL_PDU_HEADER that its channel
+/// layer must process. Without it the server passes our bytes (header
+/// included) to the channel handler as opaque data and everything we send
+/// is silently unparsable there.
+const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x0000_0010;
+
+/// Maximum payload per virtual channel chunk. MS-RDPBCGR leaves the size to the
+/// client; 1600 bytes is what FreeRDP uses and is safe with every server.
+const CHANNEL_CHUNK_LENGTH: usize = 1600;
+
 /// ASN1 structure use by mcs layer
 /// to inform on conference capability
 fn domain_parameters(max_channel_ids: u32, maw_user_ids: u32, max_token_ids: u32,
@@ -164,7 +177,10 @@ pub struct Client<S> {
     /// User id session negotiated by the MCS
     user_id: Option<u16>,
     /// Map that translate channel name to channel id
-    channel_ids : HashMap<String, u16>
+    channel_ids : HashMap<String, u16>,
+    /// Accumulated fragments of the current channel message (non-global
+    /// channels carry an 8-byte CHANNEL_PDU_HEADER and may fragment)
+    channel_fragments: Vec<u8>
 }
 
 impl<S: Read + Write> Client<S> {
@@ -173,7 +189,8 @@ impl<S: Read + Write> Client<S> {
             server_data: None,
             x224,
             user_id: None,
-            channel_ids: HashMap::new()
+            channel_ids: HashMap::new(),
+            channel_fragments: Vec::new()
         }
     }
 
@@ -191,8 +208,19 @@ impl<S: Read + Write> Client<S> {
         }));
         let client_security_data = client_security_data();
         // Request the clipboard virtual channel (CLIPRDR) in addition to the
-        // two static channels below.
-        let client_network_data = client_network_data(trame![channel_def(&"cliprdr".to_string(), 0)]);
+        // two static channels below. Options mirror FreeRDP: the server only
+        // activates the channel for data transfer with CHANNEL_OPTION_INITIALIZED,
+        // and CHANNEL_OPTION_SHOW_PROTOCOL tells it our channel PDUs carry the
+        // 8-byte CHANNEL_PDU_HEADER (which we then flag per message below).
+        const CHANNEL_OPTION_INITIALIZED: u32 = 0x8000_0000;
+        const CHANNEL_OPTION_ENCRYPT_RDP: u32 = 0x4000_0000;
+        const CHANNEL_OPTION_COMPRESS_RDP: u32 = 0x0080_0000;
+        const CHANNEL_OPTION_SHOW_PROTOCOL: u32 = 0x0020_0000;
+        let cliprdr_options = CHANNEL_OPTION_INITIALIZED
+            | CHANNEL_OPTION_ENCRYPT_RDP
+            | CHANNEL_OPTION_COMPRESS_RDP
+            | CHANNEL_OPTION_SHOW_PROTOCOL;
+        let client_network_data = client_network_data(trame![channel_def(&"cliprdr".to_string(), cliprdr_options)]);
         let user_data = to_vec(&trame![
             trame![block_header(Some(MessageType::CsCore), Some(client_core_data.length() as u16)), client_core_data],
             trame![block_header(Some(MessageType::CsSecurity), Some(client_security_data.length() as u16)), client_security_data],
@@ -249,6 +277,11 @@ impl<S: Read + Write> Client<S> {
         }
 
         // Create list of requested channels
+        if std::env::var("RDP_CHAN_LOG").is_ok() {
+            let mut ids: Vec<(String, u16)> = self.channel_ids.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            ids.sort();
+            eprintln!("[chan-dbg] user_id={:?} channel ids: {:?}", self.user_id, ids);
+        }
         for channel_id in self.channel_ids.values() {
             self.x224.write(channel_join_request(self.user_id, Some(*channel_id))?)?;
             if !read_channel_join_confirm(self.user_id.unwrap(), *channel_id, &mut try_let!(tpkt::Payload::Raw, self.x224.read()?)?)? {
@@ -272,14 +305,67 @@ impl<S: Read + Write> Client<S> {
     pub fn write<T: 'static>(&mut self, channel_name: &String, message: T) -> RdpResult<()>
     where T: Message {
         let channel_id = *self.channel_ids.get(channel_name).ok_or(Error::RdpError(RdpError::new(RdpErrorKind::Unknown, &format!("MCS: unknown channel {:?}", channel_name))))?;
-        self.x224.write(trame![
-            mcs_pdu_header(Some(DomainMCSPDU::SendDataRequest), None),
-            U16::BE(self.user_id.unwrap() - 1001),
-            U16::BE(channel_id),
-            0x70 as u8,
-            per::write_length(message.length() as u16)?,
-            message
-        ])
+        let user_id = self.user_id.unwrap() - 1001;
+        if std::env::var("RDP_CHAN_LOG").is_ok() {
+            eprintln!("[chan-dbg] write {} -> channel_id={} initiator={}", channel_name, channel_id, user_id);
+        }
+
+        if channel_name == "global" {
+            // The global channel carries share control PDUs directly, no
+            // channel header.
+            return self.x224.write(trame![
+                mcs_pdu_header(Some(DomainMCSPDU::SendDataRequest), None),
+                U16::BE(user_id),
+                U16::BE(channel_id),
+                0x70 as u8,
+                // FreeRDP always uses the two-byte PER length for userData
+                // (even when <= 0x7f); observed behaviour is that short-form
+                // lengths work for the global channel but are silently dropped
+                // on user channels, so use the long form everywhere.
+                U16::BE((message.length() as u16) | 0x8000),
+                message
+            ]);
+        }
+
+        // Static virtual channels (cliprdr) wrap their data in an 8 byte
+        // CHANNEL_PDU_HEADER - uncompressed length followed by flags - and may
+        // split one message over several chunks. The receive path already
+        // expects that header, so sending without it made the server drop every
+        // clipboard message without so much as a reply.
+        let body = to_vec(&message);
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + CHANNEL_CHUNK_LENGTH).min(body.len());
+            let chunk = &body[offset..end];
+            let mut flags = CHANNEL_FLAG_SHOW_PROTOCOL;
+            if offset == 0 {
+                flags |= CHANNEL_FLAG_FIRST;
+            }
+            if end == body.len() {
+                flags |= CHANNEL_FLAG_LAST;
+            }
+            let mut header = Vec::with_capacity(8);
+            // The length field is the TOTAL message size (all fragments),
+            // not this chunk's size (MS-RDPBCGR 3.1.5.2.2)
+            header.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            header.extend_from_slice(&flags.to_le_bytes());
+
+            self.x224.write(trame![
+                mcs_pdu_header(Some(DomainMCSPDU::SendDataRequest), None),
+                U16::BE(user_id),
+                U16::BE(channel_id),
+                0x70 as u8,
+                U16::BE(((8 + chunk.len()) as u16) | 0x8000),
+                header,
+                chunk.to_vec()
+            ])?;
+
+            offset = end;
+            if end == body.len() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Receive a message for a specific channel
@@ -297,36 +383,73 @@ impl<S: Read + Write> Client<S> {
     /// }
     /// ```
     pub fn read(&mut self) -> RdpResult<(String, tpkt::Payload)> {
-        let message = self.x224.read()?;
-        match message {
-            tpkt::Payload::Raw(mut payload) => {
-                 let mut header = mcs_pdu_header(None, None);
-                header.read(&mut payload)?;
-                if header >> 2 == DomainMCSPDU::DisconnectProviderUltimatum as u8 {
-                    return Err(Error::RdpError(RdpError::new(RdpErrorKind::Disconnect, "MCS: Disconnect Provider Ultimatum")));
+        loop {
+            let message = self.x224.read()?;
+            match message {
+                tpkt::Payload::Raw(mut payload) => {
+                    let mut header = mcs_pdu_header(None, None);
+                    header.read(&mut payload)?;
+                    if header >> 2 == DomainMCSPDU::DisconnectProviderUltimatum as u8 {
+                        return Err(Error::RdpError(RdpError::new(RdpErrorKind::Disconnect, "MCS: Disconnect Provider Ultimatum")));
+                    }
+
+                    if header >> 2 != DomainMCSPDU::SendDataIndication as u8 {
+                        return Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidData, "MCS: Invalid opcode")));
+                    }
+
+                    // Server user id
+                    per::read_integer_16(1001, &mut payload)?;
+
+                    let channel_id = per::read_integer_16(0, &mut payload)?;
+                    let channel_name = self.channel_ids.iter().find(|x| *x.1 == channel_id).map(|x| x.0.clone()).ok_or(Error::RdpError(RdpError::new(RdpErrorKind::Unknown, "MCS: unknown channel")))?;
+
+                    per::read_enumerates(&mut payload)?;
+                    per::read_length(&mut payload)?;
+
+                    if channel_name == "global" {
+                        return Ok((channel_name, tpkt::Payload::Raw(payload)));
+                    }
+
+                    // User channels (e.g. cliprdr) wrap their data in an
+                    // 8-byte CHANNEL_PDU_HEADER: the length field is the TOTAL
+                    // message size (all fragments), the chunk is the rest of
+                    // this indication, and one message may span several
+                    // indications (MS-RDPBCGR 3.1.5.2.2)
+                    let mut data = Vec::new();
+                    payload.read_to_end(&mut data)?;
+                    if data.len() < 8 {
+                        continue;
+                    }
+                    let total = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                    if std::env::var("RDP_CHAN_LOG").is_ok() {
+                        eprintln!(
+                            "[chan-rx] {} indication: chunk={} total={} flags={:#x} (accumulated={})",
+                            channel_name,
+                            data.len() - 8,
+                            total,
+                            flags,
+                            self.channel_fragments.len()
+                        );
+                    }
+                    if total > 64 * 1024 * 1024 {
+                        eprintln!("MCS: channel message length {} exceeds the 64 MB sanity bound, dropping fragments", total);
+                        self.channel_fragments.clear();
+                        continue;
+                    }
+                    self.channel_fragments.extend_from_slice(&data[8..]);
+                    if flags & CHANNEL_FLAG_LAST != 0 && !self.channel_fragments.is_empty() {
+                        let message = std::mem::replace(&mut self.channel_fragments, Vec::new());
+                        return Ok((channel_name, tpkt::Payload::Raw(Cursor::new(message))));
+                    }
+                    // No complete message yet: read the next indication
+                },
+                tpkt::Payload::FastPath(sec_flag, payload) => {
+                    // fastpath packet are dedicated to global channel
+                    return Ok(("global".to_string(), tpkt::Payload::FastPath(sec_flag, payload)));
                 }
-
-                if header >> 2 != DomainMCSPDU::SendDataIndication as u8 {
-                    return Err(Error::RdpError(RdpError::new(RdpErrorKind::InvalidData, "MCS: Invalid opcode")));
-                }
-
-                // Server user id
-                per::read_integer_16(1001, &mut payload)?;
-
-                let channel_id = per::read_integer_16(0, &mut payload)?;
-                let channel = self.channel_ids.iter().find(|x| *x.1 == channel_id).ok_or(Error::RdpError(RdpError::new(RdpErrorKind::Unknown, "MCS: unknown channel")))?;
-
-                per::read_enumerates(&mut payload)?;
-                per::read_length(&mut payload)?;
-
-                Ok((channel.0.clone(), tpkt::Payload::Raw(payload)))
-            },
-            tpkt::Payload::FastPath(sec_flag, payload) => {
-                // fastpath packet are dedicated to global channel
-                Ok(("global".to_string(), tpkt::Payload::FastPath(sec_flag, payload)))
             }
         }
-
     }
 
     /// Send a close event to server

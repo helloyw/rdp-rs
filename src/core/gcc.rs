@@ -276,10 +276,13 @@ pub fn server_security_data() -> Component {
     ]
 }
 
-/// Actually we have no more classic channel
+/// A channel definition: 8-byte null-padded name + options
 pub fn channel_def(name: &String, options: u32) -> Component {
+    let mut name_field = name.as_bytes().to_vec();
+    name_field.truncate(8);
+    name_field.resize(8, 0);
     component![
-        "name"=> name.as_bytes().to_vec(),
+        "name"=> name_field,
         "options" => U32::LE(options)
     ]
 }

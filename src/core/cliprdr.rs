@@ -2,7 +2,7 @@ use core::mcs;
 use core::tpkt;
 use core::event::{ClipboardEvent, ClipboardFormat, FileContentsRequest, RdpEvent};
 use model::error::{RdpResult, Error, RdpError, RdpErrorKind};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
 /// CLIPRDR message types (MS-RDPECLIP 2.2.1)
 const CB_MONITOR_READY: u16 = 0x0001;
@@ -19,6 +19,8 @@ const CB_RESPONSE_OK: u16 = 0x0001;
 /// Capability flags (MS-RDPECLIP 2.2.2.1.1.1)
 const CB_USE_LONG_FORMAT_NAMES: u32 = 0x00000002;
 const CB_STREAM_FILECLIP_ENABLED: u32 = 0x00000004;
+const CB_FILECLIP_NO_FILE_PATHS: u32 = 0x00000008;
+const CB_CAN_LOCK_CLIPDATA: u32 = 0x00000010;
 
 /// FileContentsRequest dwFlags (MS-RDPECLIP 2.2.5.2)
 pub const FILECONTENTS_SIZE: u32 = 0x00000001;
@@ -78,29 +80,96 @@ fn read_packet(payload: &mut dyn Read) -> RdpResult<(u16, u16, Vec<u8>)> {
     Ok((msg_type, msg_flags, data))
 }
 
-/// Serialize one format list entry (long format names: 4 + 64 bytes)
+/// Append one format list entry.
+///
+/// The long-name shape is a 4 byte format id followed by a null-terminated
+/// UTF-16LE name whose length is whatever the name needs - it is *not* a fixed
+/// block. Standard formats carry an empty name, so their entry is just the id
+/// plus the terminator. FreeRDP reads and writes exactly that shape in
+/// cliprdr_common.c (it advances `(wcslen(name) + 1) * 2` bytes per entry).
+/// Emitting a fixed 64 byte name block instead made the server drop the whole
+/// list without even acknowledging it, so nothing could be pasted remotely.
 fn write_format_entry(out: &mut Vec<u8>, id: u32, name: &str) {
     out.extend_from_slice(&id.to_le_bytes());
-    let mut name_field = [0u16; 32];
-    for (i, c) in name.encode_utf16().take(31).enumerate() {
-        name_field[i] = c;
+    // 255 units is far beyond any real clipboard format name; the bound only
+    // stops a pathological name from inflating the PDU.
+    for unit in name.encode_utf16().take(255) {
+        out.extend_from_slice(&unit.to_le_bytes());
     }
-    for c in name_field.iter() {
-        out.extend_from_slice(&c.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+}
+
+/// Parse a whole format list.
+///
+/// `use_long` reflects what the peer negotiated in its CB_CLIP_CAPS and picks
+/// the preferred shape. The other shape is still tried as a tolerant fallback
+/// because real servers do not always honour the capability flag.
+fn parse_format_list(data: &[u8], use_long: bool) -> Option<Vec<ClipboardFormat>> {
+    let long_strict = || parse_long_format_list(data, true);
+    let long_lenient = || parse_long_format_list(data, false);
+    let short_strict = || parse_short_format_list(data, true);
+    let short_lenient = || parse_short_format_list(data, false);
+    if use_long {
+        long_strict()
+            .or_else(long_lenient)
+            .or_else(short_strict)
+            .or_else(short_lenient)
+    } else {
+        short_strict()
+            .or_else(short_lenient)
+            .or_else(long_strict)
+            .or_else(long_lenient)
     }
 }
 
-/// Parse a whole format list. Tries long (64-byte) names first, then short
-/// (32-byte) ones; strict parses first (names/ids consistent), then lenient.
-fn parse_format_list(data: &[u8]) -> Option<Vec<ClipboardFormat>> {
-    parse_format_list_with_name_size(data, 64, true)
-        .or_else(|| parse_format_list_with_name_size(data, 32, true))
-        .or_else(|| parse_format_list_with_name_size(data, 64, false))
-        .or_else(|| parse_format_list_with_name_size(data, 32, false))
+/// Long format names: a 4 byte id followed by a null-terminated UTF-16LE name
+/// of variable length.
+fn parse_long_format_list(data: &[u8], strict: bool) -> Option<Vec<ClipboardFormat>> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut formats = Vec::new();
+    let mut pos = 0usize;
+    while data.len() >= pos + 4 {
+        let id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let mut units: Vec<u16> = Vec::new();
+        let mut terminated = false;
+        while data.len() >= pos + 2 {
+            let unit = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            if unit == 0 {
+                terminated = true;
+                break;
+            }
+            units.push(unit);
+        }
+        if !terminated {
+            return None;
+        }
+        let name = String::from_utf16_lossy(&units);
+        // Standard formats (id < 0xC000) carry an empty name, registered
+        // formats (id >= 0xC000) a non-empty one
+        if strict && (id < 0xC000) != name.is_empty() {
+            return None;
+        }
+        formats.push(ClipboardFormat { id, name });
+    }
+    // Up to three trailing bytes are tolerated; a longer tail means the walk
+    // lost the framing and this is not really a long-name list.
+    if data.len() - pos >= 4 {
+        return None;
+    }
+    if formats.is_empty() {
+        None
+    } else {
+        Some(formats)
+    }
 }
 
-fn parse_format_list_with_name_size(data: &[u8], name_size: usize, strict: bool) -> Option<Vec<ClipboardFormat>> {
-    let entry_size = 4 + name_size;
+/// Short format names: fixed 36 byte entries (4 byte id + 32 byte name block)
+fn parse_short_format_list(data: &[u8], strict: bool) -> Option<Vec<ClipboardFormat>> {
+    let entry_size = 4 + 32;
     if data.is_empty() || data.len() % entry_size != 0 {
         return None;
     }
@@ -109,8 +178,6 @@ fn parse_format_list_with_name_size(data: &[u8], name_size: usize, strict: bool)
         let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let units: Vec<u16> = chunk[4..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let name = read_null_terminated_utf16(&units);
-        // Standard formats (id < 0xC000) carry an empty name, registered
-        // formats (id >= 0xC000) a non-empty one
         if strict && (id < 0xC000) != name.is_empty() {
             return None;
         }
@@ -208,15 +275,17 @@ pub struct Client {
     /// Format id of the outstanding CB_FORMAT_DATA_REQUEST, so the matching
     /// response can be labeled without the server echoing it
     pending_format: Option<u32>,
-    /// Whether long format names (64-byte entries) are in use
-    long_format_names: bool
+    /// Whether the server negotiated CB_USE_LONG_FORMAT_NAMES in its capability
+    /// set. Decides how *its* format lists are laid out; modern Windows always
+    /// sets it, but the flag has to be honoured rather than assumed.
+    server_long_format_names: bool
 }
 
 impl Client {
     pub fn new() -> Self {
         Client {
             pending_format: None,
-            long_format_names: true
+            server_long_format_names: true
         }
     }
 
@@ -224,31 +293,54 @@ impl Client {
     pub fn read<S: Read + Write, T>(&mut self, payload: tpkt::Payload, mcs: &mut mcs::Client<S>, mut callback: T) -> RdpResult<()>
     where T: FnMut(RdpEvent) {
         let mut payload = try_let!(tpkt::Payload::Raw, payload)?;
-        let (msg_type, msg_flags, data) = read_packet(&mut payload)?;
+        if std::env::var("RDP_CLIP_LOG").is_ok() {
+            let mut raw = Vec::new();
+            payload.read_to_end(&mut raw)?;
+            eprintln!("[clip-rx] {} bytes: {:02x?}", raw.len(), &raw[..raw.len().min(24)]);
+            payload = Cursor::new(raw);
+        }
+        // One channel message may batch several CLIPRDR messages
+        while (payload.position() as usize) < payload.get_ref().len() {
+            let (msg_type, msg_flags, data) = match read_packet(&mut payload) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("CLIPRDR: truncated message: {:?}", e);
+                    break;
+                }
+            };
+            self.dispatch(msg_type, msg_flags, &data, mcs, &mut callback)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch<S: Read + Write, T>(&mut self, msg_type: u16, msg_flags: u16, data: &[u8], mcs: &mut mcs::Client<S>, callback: &mut T) -> RdpResult<()>
+    where T: FnMut(RdpEvent) {
 
         match msg_type {
             CB_MONITOR_READY => {
                 // Announce our capabilities, then let the application layer
                 // know it should send its initial format list
-                self.write_capabilities(mcs)?;
+                self.write_capabilities(mcs, true)?;
                 callback(RdpEvent::Clipboard(ClipboardEvent::MonitorReady));
             },
             CB_CLIP_CAPS => {
-                // general capability set: generalFlags at offset 12
+                // General capability set from the server: generalFlags sits at
+                // offset 12 (after cCapabilitiesSets, capabilitySetType and
+                // capabilitySetLength)
                 if data.len() >= 16 {
                     let general_flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-                    self.long_format_names = general_flags & CB_USE_LONG_FORMAT_NAMES != 0;
+                    self.server_long_format_names = general_flags & CB_USE_LONG_FORMAT_NAMES != 0;
                 }
             },
             CB_FORMAT_LIST => {
-                match parse_format_list(&data) {
+                match parse_format_list(data, self.server_long_format_names) {
                     Some(formats) => {
                         callback(RdpEvent::Clipboard(ClipboardEvent::FormatList(formats)));
                         self.write_format_list_response(mcs)?;
                     },
                     None => {
                         eprintln!("CLIPRDR: unparseable format list ({} bytes)", data.len());
-                        mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_LIST_RESPONSE, 0, &[]))?;
+                        Self::send(mcs, CB_FORMAT_LIST_RESPONSE, 0, &[])?;
                     }
                 }
             },
@@ -264,13 +356,13 @@ impl Client {
             CB_FORMAT_DATA_RESPONSE => {
                 let format_id = self.pending_format.take().unwrap_or(0);
                 if msg_flags & CB_RESPONSE_OK != 0 || msg_flags == 0 {
-                    callback(RdpEvent::Clipboard(ClipboardEvent::DataResponse { format_id, data }));
+                    callback(RdpEvent::Clipboard(ClipboardEvent::DataResponse { format_id, data: data.to_vec() }));
                 } else {
                     eprintln!("CLIPRDR: data response failed (flags={:#x})", msg_flags);
                 }
             },
             CB_FILECONTENTS_REQUEST => {
-                let request = parse_file_contents_request(&data)?;
+                let request = parse_file_contents_request(data)?;
                 callback(RdpEvent::Clipboard(ClipboardEvent::FileContentsRequest(request)));
             },
             CB_FILECONTENTS_RESPONSE => {
@@ -289,59 +381,86 @@ impl Client {
         Ok(())
     }
 
+    /// Write one CLIPRDR message on the clipboard channel, tracing it under
+    /// `RDP_CLIP_LOG` the same way the receive path does.
+    fn send<S: Read + Write>(mcs: &mut mcs::Client<S>, msg_type: u16, msg_flags: u16, data: &[u8]) -> RdpResult<()> {
+        if std::env::var("RDP_CLIP_LOG").is_ok() {
+            eprintln!(
+                "[clip-tx] type=0x{:04x} flags=0x{:04x} len={} data={:02x?}",
+                msg_type,
+                msg_flags,
+                data.len(),
+                &data[..data.len().min(24)]
+            );
+        }
+        mcs.write(&"cliprdr".to_string(), packet(msg_type, msg_flags, data))
+    }
+
     /// Send one clipboard event to the server
     pub fn write<S: Read + Write>(&mut self, event: ClipboardEvent, mcs: &mut mcs::Client<S>) -> RdpResult<()> {
         match event {
             ClipboardEvent::MonitorReady => {
-                Err(rdp_err(RdpErrorKind::UnexpectedType, "CLIPRDR: MonitorReady cannot be sent"))
+                // Monitor Ready is exchanged in BOTH directions (MS-RDPECLIP
+                // 2.2.1.1); Windows waits for the client's before it treats the
+                // channel as usable and starts forwarding clipboard changes.
+                Self::send(mcs, CB_MONITOR_READY, 0, &[])
             },
             ClipboardEvent::FormatList(formats) => {
                 let mut data = Vec::new();
                 for format in &formats {
                     write_format_entry(&mut data, format.id, &format.name);
                 }
-                mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_LIST, 0, &data))
+                Self::send(mcs, CB_FORMAT_LIST, 0, &data)
             },
             ClipboardEvent::FormatListResponse => {
-                mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, &[]))
+                Self::send(mcs, CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, &[])
             },
             ClipboardEvent::DataRequest { format_id } => {
                 self.pending_format = Some(format_id);
-                mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_DATA_REQUEST, 0, &format_id.to_le_bytes()))
+                Self::send(mcs, CB_FORMAT_DATA_REQUEST, 0, &format_id.to_le_bytes())
             },
             ClipboardEvent::DataResponse { format_id, data } => {
                 // The server matches responses to requests by order, the
                 // format id is not echoed on the wire
                 let _ = format_id;
-                mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &data))
+                Self::send(mcs, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &data)
             },
             ClipboardEvent::FileContentsRequest(request) => {
-                mcs.write(&"cliprdr".to_string(), packet(CB_FILECONTENTS_REQUEST, 0, &write_file_contents_request(&request)))
+                Self::send(mcs, CB_FILECONTENTS_REQUEST, 0, &write_file_contents_request(&request))
             },
             ClipboardEvent::FileContentsResponse { stream_id, data } => {
                 let mut payload = Vec::with_capacity(4 + data.len());
                 payload.extend_from_slice(&stream_id.to_le_bytes());
                 payload.extend_from_slice(&data);
-                mcs.write(&"cliprdr".to_string(), packet(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &payload))
+                Self::send(mcs, CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &payload)
             }
         }
     }
 
     /// Announce the clipboard capability sets (long format names + file
     /// streaming), expected right after CB_MONITOR_READY
-    fn write_capabilities<S: Read + Write>(&self, mcs: &mut mcs::Client<S>) -> RdpResult<()> {
+    fn write_capabilities<S: Read + Write>(&self, mcs: &mut mcs::Client<S>, file_clip: bool) -> RdpResult<()> {
         let mut data = Vec::with_capacity(16);
         data.extend_from_slice(&1u16.to_le_bytes()); // numCapabilitySets
         data.extend_from_slice(&0u16.to_le_bytes()); // pad
         data.extend_from_slice(&1u16.to_le_bytes()); // capabilitySetType = general
         data.extend_from_slice(&12u16.to_le_bytes()); // capabilitySetLength
         data.extend_from_slice(&2u32.to_le_bytes()); // version = CB_CAPS_VERSION_2
-        data.extend_from_slice(&(CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED).to_le_bytes());
-        mcs.write(&"cliprdr".to_string(), packet(CB_CLIP_CAPS, 0, &data))
+        // Exactly what a working client advertises for a text clipboard:
+        // FreeRDP's X11 client sends CB_CAPS_VERSION_2 with only
+        // CB_USE_LONG_FORMAT_NAMES set, and Windows answers its format list.
+        // Advertising the file/lock flags unconditionally made the server
+        // ignore every message this client sent.
+        let mut flags = CB_USE_LONG_FORMAT_NAMES;
+        if file_clip {
+            flags |= CB_STREAM_FILECLIP_ENABLED | CB_FILECLIP_NO_FILE_PATHS;
+        }
+        data.extend_from_slice(&flags.to_le_bytes());
+        Self::send(mcs, CB_CLIP_CAPS, 0, &data)
     }
 
     fn write_format_list_response<S: Read + Write>(&self, mcs: &mut mcs::Client<S>) -> RdpResult<()> {
-        mcs.write(&"cliprdr".to_string(), packet(CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, &[]))
+        Self::send(mcs, CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, &[])
     }
 }
 
@@ -363,8 +482,31 @@ mod test {
         for f in formats() {
             write_format_entry(&mut data, f.id, &f.name);
         }
-        assert_eq!(data.len(), 2 * 68);
-        let parsed = parse_format_list(&data).unwrap();
+        // Long names are variable length: id(4) + name + NUL, so an empty name
+        // costs 6 bytes and "FileGroupDescriptorW" costs 4 + 40 + 2.
+        assert_eq!(data.len(), 6 + 4 + CB_FORMAT_NAME_FILE_GROUP_DESCRIPTOR_W.len() * 2 + 2);
+        let parsed = parse_format_list(&data, true).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, CF_UNICODETEXT);
+        assert_eq!(parsed[0].name, "");
+        assert_eq!(parsed[1].id, CB_FORMAT_ID_FILE_GROUP_DESCRIPTOR_W);
+        assert_eq!(parsed[1].name, CB_FORMAT_NAME_FILE_GROUP_DESCRIPTOR_W);
+    }
+
+    /// The exact byte shape a real server sends for a standard format plus a
+    /// registered one, so the variable-length walk is pinned down.
+    #[test]
+    fn test_parse_long_format_list_wire_shape() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&CF_UNICODETEXT.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&CB_FORMAT_ID_FILE_GROUP_DESCRIPTOR_W.to_le_bytes());
+        for unit in CB_FORMAT_NAME_FILE_GROUP_DESCRIPTOR_W.encode_utf16() {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(data.len(), 6 + 46);
+        let parsed = parse_format_list(&data, true).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].id, CF_UNICODETEXT);
         assert_eq!(parsed[1].name, CB_FORMAT_NAME_FILE_GROUP_DESCRIPTOR_W);
@@ -376,7 +518,7 @@ mod test {
         let mut data = Vec::new();
         data.extend_from_slice(&CF_UNICODETEXT.to_le_bytes());
         data.extend_from_slice(&[0u8; 32]);
-        let parsed = parse_format_list(&data).unwrap();
+        let parsed = parse_format_list(&data, false).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, CF_UNICODETEXT);
     }

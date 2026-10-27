@@ -141,7 +141,11 @@ impl<S: Read + Write> Link<S> {
     pub fn write(&mut self, message: &dyn Message) -> RdpResult<()> {
         let mut buffer = Cursor::new(Vec::new());
         message.write(&mut buffer)?;
-        self.stream.write(buffer.into_inner().as_slice())?;
+        let bytes = buffer.into_inner();
+        if std::env::var("RDP_TX_LOG").is_ok() {
+            eprintln!("[tx] {} bytes: {}", bytes.len(), bytes.iter().take(128).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
+        }
+        self.stream.write(bytes.as_slice())?;
         Ok(())
     }
 

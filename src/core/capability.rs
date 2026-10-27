@@ -482,7 +482,9 @@ pub fn ts_virtualchannel_capability_set() -> Capability {
         cap_type: CapabilitySetType::CapstypeVirtualchannel,
         message: component![
             "flags" => U32::LE(0),
-            "VCChunkSize" => Some(U32::LE(0))
+            // A real chunk size is required; advertising 0 leaves the server
+            // unable to accept virtual channel data from this client.
+            "VCChunkSize" => Some(U32::LE(1600))
         ]
     }
 }
