@@ -13,8 +13,11 @@ const CB_FORMAT_DATA_RESPONSE: u16 = 0x0005;
 const CB_CLIP_CAPS: u16 = 0x0007;
 const CB_FILECONTENTS_REQUEST: u16 = 0x0008;
 const CB_FILECONTENTS_RESPONSE: u16 = 0x0009;
+const CB_LOCK_CLIPDATA: u16 = 0x000A;
+const CB_UNLOCK_CLIPDATA: u16 = 0x000B;
 
 const CB_RESPONSE_OK: u16 = 0x0001;
+const CB_RESPONSE_FAIL: u16 = 0x0002;
 
 /// Capability flags (MS-RDPECLIP 2.2.2.1.1.1)
 const CB_USE_LONG_FORMAT_NAMES: u32 = 0x00000002;
@@ -52,7 +55,10 @@ pub struct FileDescriptor {
     /// File name (not a full path)
     pub name: String,
     pub size: u64,
-    pub is_directory: bool
+    pub is_directory: bool,
+    /// Last write time as a Windows FILETIME (100ns units since 1601-01-01);
+    /// 0 means "unknown"
+    pub modified: u64
 }
 
 /// Pack a CLIPRDR header + payload into a channel message
@@ -192,6 +198,11 @@ fn read_null_terminated_utf16(units: &[u16]) -> String {
 }
 
 /// Parse a FileGroupDescriptorW payload into file entries
+///
+/// FILEDESCRIPTORW layout (MS-RDPECLIP 2.2.5.2.2.3):
+/// dwFlags(4) clsid(16) sizel(8) pointl(8) dwFileAttributes(4)
+/// ftCreationTime(8) ftLastAccessTime(8) ftLastWriteTime(8)
+/// nFileSizeHigh(4) nFileSizeLow(4) cFileName[260] (520 bytes UTF-16)
 pub fn parse_file_group_descriptor(data: &[u8]) -> RdpResult<Vec<FileDescriptor>> {
     if data.len() < 4 {
         return Err(rdp_err(RdpErrorKind::InvalidSize, "CLIPRDR: FileGroupDescriptorW too short"));
@@ -204,9 +215,9 @@ pub fn parse_file_group_descriptor(data: &[u8]) -> RdpResult<Vec<FileDescriptor>
             return Err(rdp_err(RdpErrorKind::InvalidSize, "CLIPRDR: truncated FILEDESCRIPTORW"));
         }
         let fixed = &data[offset..offset + FILE_DESCRIPTOR_FIXED_SIZE];
-        let attributes = u32::from_le_bytes([fixed[32], fixed[33], fixed[34], fixed[35]]);
-        let size = u32::from_le_bytes([fixed[56], fixed[57], fixed[58], fixed[59]]) as u64
-            | ((u32::from_le_bytes([fixed[60], fixed[61], fixed[62], fixed[63]]) as u64) << 32);
+        let attributes = u32::from_le_bytes([fixed[36], fixed[37], fixed[38], fixed[39]]);
+        let size = u32::from_le_bytes([fixed[68], fixed[69], fixed[70], fixed[71]]) as u64
+            | ((u32::from_le_bytes([fixed[64], fixed[65], fixed[66], fixed[67]]) as u64) << 32);
         let units: Vec<u16> = fixed[72..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let name = read_null_terminated_utf16(&units);
         if name.is_empty() {
@@ -215,27 +226,46 @@ pub fn parse_file_group_descriptor(data: &[u8]) -> RdpResult<Vec<FileDescriptor>
         files.push(FileDescriptor {
             name,
             size,
-            is_directory: attributes & 0x10 != 0
+            is_directory: attributes & 0x10 != 0,
+            modified: u64::from_le_bytes([
+                fixed[56], fixed[57], fixed[58], fixed[59],
+                fixed[60], fixed[61], fixed[62], fixed[63]
+            ])
         });
         offset += FILE_DESCRIPTOR_FIXED_SIZE;
     }
     Ok(files)
 }
 
+/// FILETIME epoch difference (1601 → 1970) in 100ns units
+const FILETIME_EPOCH_OFFSET: u64 = 116444736000000000;
+
+/// Convert a Unix timestamp to a Windows FILETIME
+pub fn unix_time_to_filetime(secs: u64, nanos: u64) -> u64 {
+    secs * 10_000_000 + nanos / 100 + FILETIME_EPOCH_OFFSET
+}
+
 /// Serialize a FileGroupDescriptorW payload from file entries
 pub fn write_file_group_descriptor(files: &[FileDescriptor]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + files.len() * FILE_DESCRIPTOR_FIXED_SIZE);
     out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    // FD_ATTRIBUTES | FD_FILESIZE | FD_WRITESTIME | FD_PROGRESSUI | FD_UNICODE,
+    // mirroring FreeRDP (winpr clipboard/synthetic_file.c). FD_ATTRIBUTES is
+    // not optional in practice: without it Explorer reads the attributes as
+    // zero and never proceeds to the FileContents requests.
+    const FD_FLAGS: u32 = 0x00000004 | 0x00000040 | 0x00000020 | 0x00004000 | 0x80000000;
     for file in files {
         let mut fixed = [0u8; FILE_DESCRIPTOR_FIXED_SIZE];
-        // dwFlags: FD_WRITESTIME | FD_FILESIZE | FD_UNICODE
-        fixed[0..4].copy_from_slice(&0x80000060u32.to_le_bytes());
+        // dwFlags
+        fixed[0..4].copy_from_slice(&FD_FLAGS.to_le_bytes());
         // dwFileAttributes
         let attributes: u32 = if file.is_directory { 0x10 } else { 0x80 };
-        fixed[32..36].copy_from_slice(&attributes.to_le_bytes());
+        fixed[36..40].copy_from_slice(&attributes.to_le_bytes());
+        // ftLastWriteTime
+        fixed[56..64].copy_from_slice(&file.modified.to_le_bytes());
         // nFileSizeHigh / nFileSizeLow
-        fixed[56..60].copy_from_slice(&(file.size as u32).to_le_bytes());
-        fixed[60..64].copy_from_slice(&((file.size >> 32) as u32).to_le_bytes());
+        fixed[64..68].copy_from_slice(&((file.size >> 32) as u32).to_le_bytes());
+        fixed[68..72].copy_from_slice(&(file.size as u32).to_le_bytes());
         // cFileName[260]
         for (i, c) in file.name.encode_utf16().take(259).enumerate() {
             fixed[72 + i * 2..74 + i * 2].copy_from_slice(&c.to_le_bytes());
@@ -255,18 +285,26 @@ fn parse_file_contents_request(data: &[u8]) -> RdpResult<FileContentsRequest> {
         flags: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
         position: u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as u64
             | ((u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as u64) << 32),
-        size: u32::from_le_bytes([data[20], data[21], data[22], data[23]])
+        size: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
+        clip_data_id: if data.len() >= 28 {
+            u32::from_le_bytes([data[24], data[25], data[26], data[27]])
+        } else {
+            0
+        }
     })
 }
 
 fn write_file_contents_request(request: &FileContentsRequest) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24);
+    // 28 bytes: the optional clipDataId is always written (FreeRDP does the
+    // same; servers that don't use locks ignore it)
+    let mut out = Vec::with_capacity(28);
     out.extend_from_slice(&request.stream_id.to_le_bytes());
     out.extend_from_slice(&request.index.to_le_bytes());
     out.extend_from_slice(&request.flags.to_le_bytes());
     out.extend_from_slice(&(request.position as u32).to_le_bytes());
     out.extend_from_slice(&((request.position >> 32) as u32).to_le_bytes());
     out.extend_from_slice(&request.size.to_le_bytes());
+    out.extend_from_slice(&request.clip_data_id.to_le_bytes());
     out
 }
 
@@ -366,13 +404,18 @@ impl Client {
                 callback(RdpEvent::Clipboard(ClipboardEvent::FileContentsRequest(request)));
             },
             CB_FILECONTENTS_RESPONSE => {
-                if data.len() >= 4 {
+                if msg_flags & CB_RESPONSE_FAIL != 0 {
+                    eprintln!("CLIPRDR: file contents request failed (flags={:#x})", msg_flags);
+                } else if data.len() >= 4 {
                     let stream_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     callback(RdpEvent::Clipboard(ClipboardEvent::FileContentsResponse {
                         stream_id,
                         data: data[4..].to_vec()
                     }));
                 }
+            },
+            CB_LOCK_CLIPDATA | CB_UNLOCK_CLIPDATA => {
+                // Lock/unlock acknowledgements; nothing to do
             },
             _ => {
                 eprintln!("CLIPRDR: unhandled message type {:#x}", msg_type);
@@ -433,6 +476,12 @@ impl Client {
                 payload.extend_from_slice(&stream_id.to_le_bytes());
                 payload.extend_from_slice(&data);
                 Self::send(mcs, CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &payload)
+            },
+            ClipboardEvent::LockClipboardData { clip_data_id } => {
+                Self::send(mcs, CB_LOCK_CLIPDATA, 0, &clip_data_id.to_le_bytes())
+            },
+            ClipboardEvent::UnlockClipboardData { clip_data_id } => {
+                Self::send(mcs, CB_UNLOCK_CLIPDATA, 0, &clip_data_id.to_le_bytes())
             }
         }
     }
@@ -526,8 +575,8 @@ mod test {
     #[test]
     fn test_file_group_descriptor_roundtrip() {
         let files = vec![
-            FileDescriptor { name: "hello.txt".to_string(), size: 12345, is_directory: false },
-            FileDescriptor { name: "目录".to_string(), size: 0, is_directory: true },
+            FileDescriptor { name: "hello.txt".to_string(), size: 12345, is_directory: false, modified: 133_000_000_000_000_000 },
+            FileDescriptor { name: "目录".to_string(), size: 0, is_directory: true, modified: 0 },
         ];
         let data = write_file_group_descriptor(&files);
         assert_eq!(data.len(), 4 + 2 * FILE_DESCRIPTOR_FIXED_SIZE);
@@ -543,12 +592,14 @@ mod test {
             flags: FILECONTENTS_RANGE,
             position: 0x1_0000_0000,
             size: 65536,
+            clip_data_id: 42,
         };
         let data = write_file_contents_request(&request);
-        assert_eq!(data.len(), 24);
+        assert_eq!(data.len(), 28);
         let parsed = parse_file_contents_request(&data).unwrap();
         assert_eq!(parsed.stream_id, 7);
         assert_eq!(parsed.index, 1);
+        assert_eq!(parsed.clip_data_id, 42);
         assert_eq!(parsed.flags, FILECONTENTS_RANGE);
         assert_eq!(parsed.position, 0x1_0000_0000);
         assert_eq!(parsed.size, 65536);

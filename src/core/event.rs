@@ -178,7 +178,10 @@ pub struct FileContentsRequest {
     /// FILECONTENTS_SIZE (0x1) or FILECONTENTS_RANGE (0x2)
     pub flags: u32,
     pub position: u64,
-    pub size: u32
+    pub size: u32,
+    /// Optional lock id (required by servers that advertise
+    /// CB_CAN_LOCK_CLIPDATA when reading file contents)
+    pub clip_data_id: u32
 }
 
 /// All events of the clipboard virtual channel (CLIPRDR)
@@ -211,6 +214,13 @@ pub enum ClipboardEvent {
     FileContentsResponse {
         stream_id: u32,
         data: Vec<u8>
+    },
+    /// CB_LOCK_CLIPDATA / CB_UNLOCK_CLIPDATA
+    LockClipboardData {
+        clip_data_id: u32
+    },
+    UnlockClipboardData {
+        clip_data_id: u32
     }
 }
 
